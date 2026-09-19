@@ -28,6 +28,9 @@ export interface ConversationState {
   lastOutputTokens: number;
   lastMessageCount: number;
   lastMessages: unknown[];
+  /** The tier Claude Code itself requested on the most recent turn, used to
+   * detect a manual `/model` change so the router doesn't fight it. */
+  lastRequestedTier: Tier;
 }
 
 export type Decision =

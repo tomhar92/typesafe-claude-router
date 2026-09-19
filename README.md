@@ -82,9 +82,6 @@ numbers from the report.
   Claude Code's HTTP client doesn't keep that connection alive across
   turns, routing state won't persist between turns — verify this in your
   own environment before relying on the sticky/break-even logic.
-- Usage-token extraction scans the raw response bytes for `usage` objects
-  rather than a full SSE event parser — pragmatic for v1, revisit if a
-  real session shows missing usage data in the ledger.
 - The upgrade-suggestion note is injected as conversation content for the
   model to relay, not a UI element — it depends on the model choosing to
   mention it.

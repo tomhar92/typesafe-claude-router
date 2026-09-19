@@ -13,6 +13,7 @@ export function getOrInitState(socket: object, initialTier: Tier): ConversationS
       lastOutputTokens: 0,
       lastMessageCount: 0,
       lastMessages: [],
+      lastRequestedTier: initialTier,
     };
     store.set(socket, state);
   }
