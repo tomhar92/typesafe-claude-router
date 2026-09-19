@@ -1155,7 +1155,12 @@ Expected: FAIL — `Cannot find module '../src/classify.js'`.
 import { choice, TypeSafeClient } from "@typesafe-ai/sdk";
 import type { ClassifyResult, Tier } from "./types.js";
 
-const client = new TypeSafeClient();
+let client: TypeSafeClient | undefined;
+
+function getClient(): TypeSafeClient {
+  if (!client) client = new TypeSafeClient();
+  return client;
+}
 
 const TIER_CRITERIA = {
   haiku:
@@ -1176,7 +1181,7 @@ export interface ClassifyInput {
 type SystemOneCall = (args: unknown) => Promise<any>;
 
 function defaultCall(args: unknown): Promise<any> {
-  return client.systemOne(args as never);
+  return getClient().systemOne(args as never);
 }
 
 function withTimeout<T>(promise: Promise<T>, ms: number): Promise<T> {
@@ -1231,7 +1236,7 @@ export async function classifyTurn(
 - [ ] **Step 4: Run test to verify it passes**
 
 Run: `npm test`
-Expected: PASS (all classify tests). These tests never contact the real TypeSafe API — they inject `call` directly, per the "Testing mode: live keys available" decision, live-API verification happens in the manual end-to-end pass (Task 13), not in the automated suite.
+Expected: PASS (all classify tests). These tests never contact the real TypeSafe API — they inject `call` directly, per the "Testing mode: live keys available" decision, live-API verification happens in the manual end-to-end pass (Task 13), not in the automated suite. The client is constructed lazily (`getClient()`), not at module load — `new TypeSafeClient()` throws immediately if `TYPESAFE_API_KEY` isn't set, and an eager top-level instantiation would crash on import before a test ever got the chance to inject its own `call`.
 
 - [ ] **Step 5: Commit**
 
