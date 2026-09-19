@@ -466,7 +466,7 @@ test("has no downgrade candidate when current tier is already the cheapest", () 
 
 test("has no upgrade candidate when current tier is already the priciest", () => {
   const result = computeMargins(
-    { haiku: 0.1, sonnet: 0.2, opus: 0.2, fable: 0.5 },
+    { haiku: 0.1, sonnet: 0.15, opus: 0.25, fable: 0.5 },
     "fable"
   );
   assert.equal(result.upgradeCandidate, null);
