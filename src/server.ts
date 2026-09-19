@@ -6,6 +6,7 @@ import { classifyTurn, type ClassifyInput } from "./classify.js";
 import { DEFAULT_PRICING, tierForModel } from "./pricing.js";
 import { appendLedgerLine, computeCostUsd } from "./ledger.js";
 import { buildUpgradeNoteBlock } from "./upgradeNote.js";
+import { UsageAccumulator } from "./usage.js";
 import type { PricingConfig, Tier, ClassifyResult } from "./types.js";
 
 export interface ServerOptions {
@@ -54,8 +55,20 @@ export async function handleMessages(
   const bodyBuf = await readBody(req);
   const body = JSON.parse(bodyBuf.toString("utf8"));
   const requestedModel: string = body.model;
-  const initialTier: Tier = tierForModel(pricing, requestedModel) ?? "sonnet";
-  const state = getOrInitState(req.socket, initialTier);
+  const requestedTier: Tier = tierForModel(pricing, requestedModel) ?? "sonnet";
+  const state = getOrInitState(req.socket, requestedTier);
+
+  // Claude Code re-sends whatever tier it thinks the session is on. If that
+  // no longer matches what we tracked last turn, the user changed it
+  // out-of-band (e.g. `/model opus`) - honor that immediately instead of
+  // silently sticking to the router's last pick below. The cache is being
+  // rebuilt by the model change regardless, so there's no switch-tax reason
+  // to fight it.
+  const userChangedModel = requestedTier !== state.lastRequestedTier;
+  state.lastRequestedTier = requestedTier;
+  if (userChangedModel) {
+    state.currentTier = requestedTier;
+  }
 
   const messages: any[] = Array.isArray(body.messages) ? body.messages : [];
   const latestUserMessage = extractLatestUserText(messages);
@@ -73,14 +86,22 @@ export async function handleMessages(
     ? decide(classification, state, messages, pricing)
     : ({ kind: "held" } as const);
 
-  let outgoingModel = requestedModel;
   const isSwitch =
     decision.kind === "downgraded" ||
     decision.kind === "downgraded-on-reset" ||
     decision.kind === "upgraded-on-reset";
 
-  if (mode === "live" && isSwitch) {
-    outgoingModel = pricing.modelAlias[decision.to];
+  // A "held" (or upgrade-suggested, which never auto-switches) decision
+  // means: stay on the tier the router already put this conversation on,
+  // not "revert to whatever Claude Code's own request happens to say" -
+  // Claude Code keeps resending its own default every turn, so falling
+  // back to `requestedModel` here undid every downgrade after exactly one
+  // turn and paid the cache-rebuild tax again going back.
+  const targetTier: Tier = isSwitch ? decision.to : state.currentTier;
+
+  let outgoingModel = requestedModel;
+  if (mode === "live") {
+    outgoingModel = pricing.modelAlias[targetTier];
     body.model = outgoingModel;
   }
 
@@ -111,34 +132,22 @@ export async function handleMessages(
 
   res.writeHead(upstreamResponse.status, Object.fromEntries(upstreamResponse.headers.entries()));
 
-  const usage = { inputTokens: 0, outputTokens: 0, cacheCreationTokens: 0, cacheReadTokens: 0 };
   const actualModel = mode === "live" ? outgoingModel : requestedModel;
-  const actualTier = tierForModel(pricing, actualModel) ?? state.currentTier;
+  const actualTier = tierForModel(pricing, actualModel) ?? targetTier;
 
+  const usageAccumulator = new UsageAccumulator();
   if (upstreamResponse.body) {
     const reader = upstreamResponse.body.getReader();
     const decoder = new TextDecoder();
-    let buffered = "";
     for (;;) {
       const { done, value } = await reader.read();
       if (done) break;
       res.write(value);
-      buffered += decoder.decode(value, { stream: true });
-      for (const match of buffered.matchAll(/"usage"\s*:\s*(\{[^}]*\})/g)) {
-        try {
-          const parsed = JSON.parse(match[1]);
-          usage.inputTokens = parsed.input_tokens ?? usage.inputTokens;
-          usage.outputTokens = parsed.output_tokens ?? usage.outputTokens;
-          usage.cacheCreationTokens =
-            parsed.cache_creation_input_tokens ?? usage.cacheCreationTokens;
-          usage.cacheReadTokens = parsed.cache_read_input_tokens ?? usage.cacheReadTokens;
-        } catch {
-          // partial match straddling a chunk boundary; more bytes will complete it
-        }
-      }
+      usageAccumulator.push(decoder.decode(value, { stream: true }));
     }
   }
   res.end();
+  const usage = usageAccumulator.finalize();
 
   updateState(
     state,
@@ -162,7 +171,7 @@ export async function handleMessages(
   );
   const counterfactualNoRoutingCostUsd = computeCostUsd(
     pricing,
-    initialTier,
+    requestedTier,
     usage.inputTokens,
     usage.outputTokens,
     usage.cacheCreationTokens,
