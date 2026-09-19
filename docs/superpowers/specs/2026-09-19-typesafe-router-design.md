@@ -144,8 +144,11 @@ silently mis-key.
 State tracked per conversation key: `currentTier`, `turnsOnCurrentTier`,
 `lastPrefixTokens` (= `cache_read_input_tokens + cache_creation_input_tokens`
 from the previous response, i.e. the best available estimate of the next
-request's prefix size), `lastMessageCount` (length of the `messages` array
-sent last turn, used for reset detection below).
+request's prefix size), `lastNewTokens` / `lastOutputTokens` (= the
+previous response's `input_tokens` / `output_tokens` — the non-cached
+portion of that turn, needed for the break-even math below), and
+`lastMessageCount` (length of the `messages` array sent last turn, used
+for reset detection below).
 
 Tier order for comparison purposes: `haiku < sonnet < opus < fable`.
 
@@ -189,17 +192,45 @@ Given that:
 3. Otherwise, act on whichever margin is larger (the more decisive signal
    of the two, in the rare case a distribution clears the threshold on
    both sides at once):
-   - **Downgrade wins:** compute the switch-tax math —
-     `switchCost = lastPrefixTokens * writeRate[downgradeCandidate]`,
-     `perTurnSavings = lastPrefixTokens * (readRate[currentTier] - readRate[downgradeCandidate])`,
-     `breakEvenTurns = switchCost / perTurnSavings`. Switch automatically,
-     no human involved, only if `breakEvenTurns <= STICKY_ASSUMPTION`
-     (default 3, configurable) — i.e. only when the router expects to
-     recoup the one-time tax within a conservative number of turns. Else
-     hold.
-   - **Upgrade wins:** an upgrade never pays for itself in cache terms (it
-     only ever costs more), so there's no break-even case to check — go
-     straight to "Upgrade suggestions" below.
+   - **Downgrade wins:** compute the switch-tax math over the *whole*
+     turn, not just the cached-prefix line item — the new/output tokens
+     each turn carries are priced at each tier's own rate too, and at
+     realistic Claude Code prefix sizes they're not negligible next to
+     the cache delta:
+     - `switchTurnCost` = cost of this turn if it runs on
+       `downgradeCandidate` right now (prefix at the **write** rate,
+       since switching means a cache miss; new tokens at
+       `downgradeCandidate`'s input rate; output at its output rate).
+     - `stayTurnCost` = cost of this turn if it stays on `currentTier`
+       (prefix at `currentTier`'s **read** rate; new/output tokens at
+       `currentTier`'s rates).
+     - `switchTax = switchTurnCost - stayTurnCost` — the one-time extra
+       cost of switching *this* turn versus not switching.
+     - `candidateSteadyCost` = cost of a *later* turn once settled on
+       `downgradeCandidate` (prefix at its read rate; new/output tokens
+       at its rates).
+     - `perTurnSavings = stayTurnCost - candidateSteadyCost`.
+     - `breakEvenTurns = switchTax / perTurnSavings` (hold if
+       `perTurnSavings <= 0`).
+     Switch automatically, no human involved, only if
+     `breakEvenTurns <= STICKY_ASSUMPTION` (default 3, configurable) —
+     i.e. only when the router expects to recoup the one-time tax within
+     a conservative number of turns. Else hold. (A prefix-only version of
+     this math — ignoring new/output tokens — materially understates the
+     tax's true weight relative to the savings: at the Problem section's
+     20k-prefix/1k-new/500-output example, the full formula reproduces
+     that section's ~3.2-turn break-even for Sonnet→Haiku; a prefix-only
+     version instead gives ~12.5 turns, which would make
+     `STICKY_ASSUMPTION = 3` never fire for that pair. The break-even
+     point isn't a flat "~3 turns" across all tier pairs either — it
+     scales with how big the price gap is: a steep drop like
+     Opus→Haiku pays back in well under one turn, while a shallow one
+     like Sonnet→Haiku sits right around the 3-turn line.)
+   - **Upgrade wins:** an upgrade's `switchTax` (same formula, computed
+     against `upgradeCandidate`) is always positive — spending more only
+     ever costs more, never pays for itself in cache terms — so there's
+     no break-even case to check — go straight to "Upgrade suggestions"
+     below, using `switchTax` as the estimated cost to show.
 4. On any TypeSafe error/timeout (default 2s budget): hold current tier,
    no suggestion, log the failure. The router must never block or fail a
    turn.
