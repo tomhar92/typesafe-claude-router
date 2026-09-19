@@ -57,10 +57,11 @@ Build an open-source proxy that:
      switch-tax math — it can decline to downgrade even when the
      classifier is confident, if switching isn't worth it yet.
    - **Upgrades** (pricier tier) trade money for capability, which is a
-     judgment call about the task, not just arithmetic. Above a
-     confidence threshold, the router surfaces the suggestion — with the
-     estimated switch cost shown — instead of silently applying or
-     silently ignoring it. See "Upgrade suggestions" below.
+     judgment call about the task, not just arithmetic. When the pricier
+     tier's probability is meaningfully higher than the current tier's,
+     the router surfaces the suggestion — with the estimated switch cost
+     shown — instead of silently applying or silently ignoring it. See
+     "Upgrade suggestions" below.
 3. Measures itself: logs real `usage` data from actual API responses so a
    session's real cost-with-routing can be compared against the real
    cost-if-it-had-never-routed, instead of relying on theoretical numbers.
@@ -114,10 +115,29 @@ For every incoming `POST /v1/messages` (streaming or not):
 
 ### Conversation identity
 
-Claude Code doesn't send a stable session id to the API. The router keys
-in-memory state by a hash of the request's system-prompt block content
-(stable for a session; changes on `/clear`, `/compact`, or restart, which
-is exactly when stale routing state should be discarded anyway).
+Claude Code doesn't send a stable session id to the API, and content-based
+identity (e.g. hashing the system-prompt block) has a real collision risk:
+per Claude Code's own caching docs, two sessions running concurrently in
+the same working directory and git state build byte-identical prefixes.
+Keying on that content would merge their routing state — `currentTier` and
+`turnsOnCurrentTier` from one session's turns would apply to the other's,
+since requests from both interleave against the same key.
+
+Instead, the router keys in-memory state by the **TCP connection** each
+request arrives on (e.g. `req.socket`), scoped for that connection's
+lifetime and discarded on close. Each running `claude` process holds its
+own persistent connection to the local proxy for the session's duration,
+so parallel sessions in the same directory land on distinct sockets
+regardless of identical content — no hashing, no collision. `/clear` and
+`/compact` are handled by the message-array-shape check in "Reset
+detection" below, scoped to that same connection, not by a change in key.
+
+This depends on the HTTP client Claude Code uses actually keeping the
+connection alive across turns rather than reconnecting per request; the
+end-to-end testing plan below includes verifying this. If it turns out
+not to hold, the fallback is the content-hash approach, accepting the
+same-directory collision as a known limitation to document rather than
+silently mis-key.
 
 ### Policy
 
@@ -129,37 +149,58 @@ sent last turn, used for reset detection below).
 
 Tier order for comparison purposes: `haiku < sonnet < opus < fable`.
 
-Given a classifier result `(judgedTier, confidence)`:
+The classifier call returns TypeSafe's full `probabilities` map over all
+four tiers (they sum to 1), not just the argmax `choice`/`confidence`. A
+fixed threshold on the collapsed `confidence` number is poorly calibrated
+here — with four options, a well-calibrated top pick routinely sits well
+under any threshold tuned for a binary choice, and the number that
+actually matters for a routing decision isn't "how peaked is the whole
+distribution" but "how much more likely is this specific candidate than
+the tier we're already paying for." TypeSafe's own docs are explicit that
+the collapsed `confidence` is a convenience and the full distribution is
+there to be used directly for exactly this kind of pairwise comparison.
 
-1. If `judgedTier === currentTier`: no-op, increment `turnsOnCurrentTier`.
-2. **Reset detection** (applies regardless of direction): if this
-   request's `messages` array is shorter than `lastMessageCount`, or its
-   first `lastMessageCount` entries don't match what was tracked last
-   turn, the prefix was just invalidated by something else (`/clear`,
+So the policy compares `probabilities` pairwise against `currentTier`
+rather than thresholding `confidence`:
+
+- `downgradeCandidate` = the tier cheaper than `currentTier` with the
+  highest probability; `downgradeMargin = probabilities[downgradeCandidate] - probabilities[currentTier]`.
+- `upgradeCandidate` = the tier pricier than `currentTier` with the
+  highest probability; `upgradeMargin = probabilities[upgradeCandidate] - probabilities[currentTier]`.
+- `MARGIN_THRESHOLD` (default 0.1, configurable, one value for both
+  directions) — a candidate is only actionable if its margin over
+  `currentTier` exceeds this.
+
+Given that:
+
+1. **Reset detection** (checked first, applies regardless of direction):
+   if this request's `messages` array is shorter than `lastMessageCount`,
+   or its first `lastMessageCount` entries don't match what was tracked
+   last turn, the prefix was just invalidated by something else (`/clear`,
    `/compact`, a rewind, an MCP reconnect, first turn of the session —
    Claude Code's own docs list the full set of triggers). The cache-miss
    tax is already sunk for this turn independent of anything the router
-   does, so `switchCost` is treated as ~0: apply the judged tier
-   immediately (downgrade or upgrade) if `confidence >= CONFIDENCE_THRESHOLD`,
-   no break-even math needed. Reset `turnsOnCurrentTier = 0`.
-3. Otherwise, if `confidence < CONFIDENCE_THRESHOLD` (default 0.7,
-   configurable): hold current tier, no suggestion.
-4. Otherwise compute the switch-tax math:
-   - `switchCost = lastPrefixTokens * writeRate[judgedTier]`
-   - `perTurnDelta = lastPrefixTokens * (readRate[currentTier] - readRate[judgedTier])`
-     (positive when `judgedTier` is cheaper to hold on than `currentTier`)
-   - `breakEvenTurns = switchCost / perTurnDelta` when `perTurnDelta > 0`
-5. **If `judgedTier` is a downgrade** (lower in tier order than
-   `currentTier`, so `perTurnDelta > 0` by construction): switch
-   automatically, no human involved, if `breakEvenTurns <= STICKY_ASSUMPTION`
-   (default 3, configurable) — i.e. only when the router expects to
-   recoup the one-time tax within a conservative number of turns. Else
-   hold.
-6. **If `judgedTier` is an upgrade** (higher in tier order, so
-   `perTurnDelta < 0` — an upgrade never pays for itself in cache terms,
-   it only ever costs more): never auto-switch. Instead, see "Upgrade
-   suggestions" below.
-7. On any TypeSafe error/timeout (default 2s budget): hold current tier,
+   does, so there's no cost to justify: adopt TypeSafe's argmax `choice`
+   outright, no margin check needed. Reset `turnsOnCurrentTier = 0`.
+2. Otherwise, if neither `downgradeMargin` nor `upgradeMargin` exceeds
+   `MARGIN_THRESHOLD`: hold current tier, no suggestion — the classifier
+   isn't meaningfully more confident in any other tier than the one
+   already in use.
+3. Otherwise, act on whichever margin is larger (the more decisive signal
+   of the two, in the rare case a distribution clears the threshold on
+   both sides at once):
+   - **Downgrade wins:** compute the switch-tax math —
+     `switchCost = lastPrefixTokens * writeRate[downgradeCandidate]`,
+     `perTurnSavings = lastPrefixTokens * (readRate[currentTier] - readRate[downgradeCandidate])`,
+     `breakEvenTurns = switchCost / perTurnSavings`. Switch automatically,
+     no human involved, only if `breakEvenTurns <= STICKY_ASSUMPTION`
+     (default 3, configurable) — i.e. only when the router expects to
+     recoup the one-time tax within a conservative number of turns. Else
+     hold.
+   - **Upgrade wins:** an upgrade never pays for itself in cache terms (it
+     only ever costs more), so there's no break-even case to check — go
+     straight to "Upgrade suggestions" below.
+4. On any TypeSafe error/timeout (default 2s budget): hold current tier,
    no suggestion, log the failure. The router must never block or fail a
    turn.
 
@@ -170,13 +211,15 @@ changes over time and this repo can't chase that automatically.
 
 ### Upgrade suggestions
 
-When step 6 above fires outside a reset window (i.e. the classifier wants
-a higher tier mid-session, where the switch is guaranteed to cost more
-than it saves), the router doesn't decide for the user — it surfaces the
-option and lets them decide, once confidence clears a separate
-`UPGRADE_SUGGESTION_THRESHOLD` (default 0.75, configurable, can differ
-from the downgrade threshold since the cost of a false positive here is
-an ignorable suggestion rather than a silent quality or cost change).
+When the upgrade branch above fires outside a reset window (i.e.
+`upgradeCandidate`'s margin over `currentTier` clears `MARGIN_THRESHOLD`
+mid-session, where the switch is guaranteed to cost more than it saves),
+the router doesn't decide for the user — it surfaces the option and lets
+them decide. `MARGIN_THRESHOLD` can be set separately per direction
+(`DOWNGRADE_MARGIN_THRESHOLD` / `UPGRADE_MARGIN_THRESHOLD`, both default
+0.1) since the cost of a false positive differs: an unwarranted downgrade
+silently changes quality, while an unwarranted upgrade suggestion is just
+an ignorable note.
 
 Mechanism: append a short block to the outgoing request's `messages` array
 (after the last message, so it doesn't touch anything behind the cache
@@ -206,11 +249,13 @@ Default mode is `shadow`; a person opts into `ROUTER_MODE=live`.
 
 ### Cost ledger and report
 
-Each ledger line: `{ ts, conversationKey, judgedTier, confidence, decision,
-resetDetected, suggestedUpgradeTo, suggestedUpgradeCostUsd, actualModel,
-inputTokens, outputTokens, cacheCreationTokens, cacheReadTokens,
-actualCostUsd, counterfactualNoRoutingCostUsd }`. `decision` is one of
-`held` / `downgraded` / `upgraded-on-reset` / `upgrade-suggested`.
+Each ledger line: `{ ts, conversationKey, probabilities, downgradeMargin,
+upgradeMargin, decision, resetDetected, suggestedUpgradeTo,
+suggestedUpgradeCostUsd, actualModel, inputTokens, outputTokens,
+cacheCreationTokens, cacheReadTokens, actualCostUsd,
+counterfactualNoRoutingCostUsd }`. `decision` is one of `held` /
+`downgraded` / `downgraded-on-reset` / `upgraded-on-reset` /
+`upgrade-suggested`.
 
 `counterfactualNoRoutingCostUsd` is computed from the same real token
 counts as if the turn had run on whichever tier the conversation started
@@ -235,7 +280,7 @@ typesafe-claude-router/
     policy.ts            # switch-tax decision logic (pure functions, unit-testable)
     pricing.ts           # tier -> model alias, tier -> rates, editable table
     ledger.ts             # JSONL append + read
-    conversationKey.ts     # hash system-prompt block -> key
+    conversationKey.ts     # per-connection state map; content-hash fallback
   bin/
     report.ts            # CLI entry for `report`
   test/
@@ -250,13 +295,15 @@ typesafe-claude-router/
 
 No mocking of the cache economics: `policy.ts` is pure functions over
 numbers, tested directly with unit tests covering the numeric example in
-this doc: verify it holds and downgrades, verify it declines an
-unprofitable downgrade, verify low confidence holds, verify TypeSafe
-timeout holds, verify an upgrade never auto-switches outside a reset
-window, verify reset detection applies a downgrade *and* an upgrade
-immediately with no break-even check, verify reset detection correctly
-triggers on a shortened `messages` array and doesn't false-trigger on a
-normal append-only turn.
+this doc: verify it holds when neither margin clears the threshold,
+verify it declines an unprofitable downgrade even when the margin clears,
+verify TypeSafe timeout holds, verify an upgrade never auto-switches
+outside a reset window regardless of margin size, verify reset detection
+adopts the argmax `choice` immediately with no margin or break-even
+check, verify reset detection correctly triggers on a shortened
+`messages` array and doesn't false-trigger on a normal append-only turn,
+verify the "larger margin wins" tie-break when both a downgrade and an
+upgrade candidate clear the threshold in the same turn.
 
 End-to-end validation uses live keys, per the earlier decision:
 1. Run the proxy in `shadow` mode, point a real Claude Code session at it
@@ -264,18 +311,26 @@ End-to-end validation uses live keys, per the earlier decision:
    real coding, one hard debugging question).
 2. Inspect the ledger: do judged tiers look sane, do the real
    `cache_read`/`cache_creation` numbers match the model in this doc.
-3. Run `report` and sanity-check the counterfactual math.
-4. Flip to `live` mode for a short session, confirm Claude Code's own
+3. Confirm the connection-based conversation key actually persists across
+   turns within one session (i.e. Claude Code's HTTP client keeps the
+   connection alive) before relying on it; if it doesn't, fall back to
+   content-hash keying per "Conversation identity" above. Separately,
+   run two `claude` sessions concurrently in the same directory and
+   confirm their routing state doesn't cross-contaminate.
+4. Run `report` and sanity-check the counterfactual math.
+5. Flip to `live` mode for a short session, confirm Claude Code's own
    status line reflects the model the router chose, confirm no `400`
    errors related to `cache_control`, confirm a mid-session switch is
    visible in the ledger.
 
 ## Open risks
 
-- Conversation-key hashing on the system-prompt block is a heuristic;
-  if Claude Code changes exactly what's cache-scoped, this needs
-  revisiting (see the "How Claude Code uses prompt caching" doc's layer
-  table).
+- Connection-based conversation identity assumes Claude Code's HTTP
+  client keeps one persistent connection alive per session; unverified
+  until tested end-to-end (see testing plan). If it reconnects per turn
+  instead, routing state won't persist and the design needs to fall back
+  to content-hash keying, accepting the same-directory collision risk
+  that approach carries.
 - Pricing table will drift from reality over time; the report output
   should print the pricing table's date/source so stale numbers are
   visible rather than silently wrong.
