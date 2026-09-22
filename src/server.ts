@@ -77,6 +77,16 @@ export async function handleMessages(
     res.end(JSON.stringify({ error: "invalid_request_body" }));
     return;
   }
+  // JSON.parse accepts plenty of syntactically-valid bodies that aren't a
+  // Messages API request object - `null`, `"foo"`, `42`, `[]`. Those all
+  // slip past the try/catch above and then throw on `body.model` below
+  // (or silently proceed with nonsense), so reject them here with the same
+  // clean 400 rather than letting them fall through to the 502 catch-all.
+  if (body === null || typeof body !== "object" || Array.isArray(body)) {
+    res.writeHead(400, { "content-type": "application/json" });
+    res.end(JSON.stringify({ error: "invalid_request_body" }));
+    return;
+  }
 
   const requestedModel: string = body.model;
   const requestedTier: Tier = tierForModel(pricing, requestedModel) ?? "sonnet";
@@ -88,8 +98,28 @@ export async function handleMessages(
   // silently sticking to the router's last pick below. The cache is being
   // rebuilt by the model change regardless, so there's no switch-tax reason
   // to fight it.
+  //
+  // The mutation below is provisional, for this turn's decide()/margin
+  // computation only - it's restored right after targetTier is settled
+  // (see below). The *permanent* currentTier transition, and the
+  // turnsOnCurrentTier reset/accumulate bookkeeping that goes with it, must
+  // go through updateState()'s own comparison against the real pre-turn
+  // tier, and only once we know the turn actually succeeded (the
+  // upstreamResponse.ok guard further down). Mutating state.currentTier
+  // here and leaving it mutated would both double up that bookkeeping and,
+  // on a failed upstream call, permanently poison routing state for a turn
+  // that never happened.
+  //
+  // Likewise, state.lastRequestedTier is only committed once we know the
+  // turn succeeded (alongside currentTier, further down). If a manual
+  // switch's first attempt gets rate-limited or otherwise fails, Claude
+  // Code will resend the same requested model on retry - committing
+  // lastRequestedTier here unconditionally would mark that switch as
+  // "already seen" after the failed attempt, so the retry would silently
+  // stop being recognized as a manual change and fall back to pure
+  // policy-driven routing instead of honoring it.
+  const previousTier = state.currentTier;
   const userChangedModel = requestedTier !== state.lastRequestedTier;
-  state.lastRequestedTier = requestedTier;
   if (userChangedModel) {
     state.currentTier = requestedTier;
   }
@@ -127,6 +157,12 @@ export async function handleMessages(
   // back to `requestedModel` here undid every downgrade after exactly one
   // turn and paid the cache-rebuild tax again going back.
   const targetTier: Tier = isSwitch ? decision.to : state.currentTier;
+
+  // Undo the provisional mutation above now that this turn's decision is
+  // locked in. state.currentTier goes back to reflecting reality (the tier
+  // the last *successful* turn actually ended on) until updateState()
+  // applies the real transition below.
+  state.currentTier = previousTier;
 
   let outgoingModel = requestedModel;
   if (mode === "live") {
@@ -191,6 +227,7 @@ export async function handleMessages(
   // advance and there's no trustworthy usage to log. Recording it as if it
   // had would poison both the sticky-tier state and the cost report.
   if (upstreamResponse.ok) {
+    state.lastRequestedTier = requestedTier;
     updateState(
       state,
       actualTier,
