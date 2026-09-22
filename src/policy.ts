@@ -3,9 +3,14 @@ import { detectReset } from "./reset.js";
 import { computeMargins } from "./margins.js";
 import { breakEvenTurns, switchTax } from "./breakEven.js";
 
-function envNumber(name: string, fallback: number): number {
-  const raw = process.env[name];
-  if (raw === undefined || raw === "") return fallback;
+export function envNumber(name: string, fallback: number): number {
+  // Trimmed and checked for emptiness *before* Number(): Number(" ") is 0,
+  // so an untrimmed whitespace-only value (a stray trailing space from a
+  // copy-pasted .env line, an empty template substitution, ...) would
+  // otherwise silently become a real, very-different threshold (0) rather
+  // than falling back.
+  const raw = process.env[name]?.trim();
+  if (!raw) return fallback;
   const parsed = Number(raw);
   return Number.isFinite(parsed) ? parsed : fallback;
 }

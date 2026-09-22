@@ -12,7 +12,8 @@
   },
   "scripts": {
     "build": "tsc -p .",
-    "test": "node --import tsx --test test/**/*.test.ts",
+    "typecheck": "tsc -p tsconfig.test.json",
+    "test": "npm run typecheck && node --import tsx --test test/**/*.test.ts",
     "start": "tsx src/server.ts",
     "report": "tsx bin/report.ts"
   },

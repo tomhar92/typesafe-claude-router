@@ -1,18 +1,97 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { decide } from "../src/policy.js";
+import { execFileSync } from "node:child_process";
+import { fileURLToPath } from "node:url";
+import { decide, envNumber } from "../src/policy.js";
 import { DEFAULT_PRICING } from "../src/pricing.js";
 import type { ConversationState, ClassifyResult } from "../src/types.js";
 
+const thresholdsFixture = fileURLToPath(
+  new URL("./fixtures/policy-thresholds.ts", import.meta.url)
+);
+
+function readThresholds(env: Record<string, string> = {}): { MARGIN_THRESHOLD: number; STICKY_ASSUMPTION: number } {
+  const output = execFileSync(process.execPath, ["--import", "tsx", thresholdsFixture], {
+    encoding: "utf8",
+    env: { ...process.env, ...env },
+  });
+  return JSON.parse(output);
+}
+
+test("MARGIN_THRESHOLD/STICKY_ASSUMPTION default to 0.1/3 with no env override", () => {
+  const thresholds = readThresholds();
+  assert.equal(thresholds.MARGIN_THRESHOLD, 0.1);
+  assert.equal(thresholds.STICKY_ASSUMPTION, 3);
+});
+
+test("MARGIN_THRESHOLD/STICKY_ASSUMPTION pick up ROUTER_MARGIN_THRESHOLD/ROUTER_STICKY_ASSUMPTION", () => {
+  const thresholds = readThresholds({
+    ROUTER_MARGIN_THRESHOLD: "0.25",
+    ROUTER_STICKY_ASSUMPTION: "5",
+  });
+  assert.equal(thresholds.MARGIN_THRESHOLD, 0.25);
+  assert.equal(thresholds.STICKY_ASSUMPTION, 5);
+});
+
+test("envNumber: uses the fallback when the env var is unset", () => {
+  assert.equal(envNumber("ROUTER_TEST_DOES_NOT_EXIST", 0.1), 0.1);
+});
+
+test("envNumber: parses a valid numeric value", () => {
+  process.env.ROUTER_TEST_NUMBER = "0.25";
+  try {
+    assert.equal(envNumber("ROUTER_TEST_NUMBER", 0.1), 0.25);
+  } finally {
+    delete process.env.ROUTER_TEST_NUMBER;
+  }
+});
+
+test("envNumber: falls back on an empty string, not on Number('') === 0", () => {
+  process.env.ROUTER_TEST_NUMBER = "";
+  try {
+    assert.equal(envNumber("ROUTER_TEST_NUMBER", 3), 3);
+  } finally {
+    delete process.env.ROUTER_TEST_NUMBER;
+  }
+});
+
+test("envNumber: falls back on a whitespace-only value, not on Number(' ') === 0", () => {
+  process.env.ROUTER_TEST_NUMBER = "   ";
+  try {
+    assert.equal(envNumber("ROUTER_TEST_NUMBER", 3), 3);
+  } finally {
+    delete process.env.ROUTER_TEST_NUMBER;
+  }
+});
+
+test("envNumber: falls back on a non-numeric value instead of silently becoming NaN", () => {
+  process.env.ROUTER_TEST_NUMBER = "not-a-number";
+  try {
+    assert.equal(envNumber("ROUTER_TEST_NUMBER", 3), 3);
+  } finally {
+    delete process.env.ROUTER_TEST_NUMBER;
+  }
+});
+
+test("envNumber: falls back on Infinity/-Infinity instead of a threshold no margin could ever clear", () => {
+  process.env.ROUTER_TEST_NUMBER = "Infinity";
+  try {
+    assert.equal(envNumber("ROUTER_TEST_NUMBER", 0.1), 0.1);
+  } finally {
+    delete process.env.ROUTER_TEST_NUMBER;
+  }
+});
+
 function state(overrides: Partial<ConversationState> = {}): ConversationState {
   return {
+    connectionId: "conn-1",
     currentTier: "sonnet",
     turnsOnCurrentTier: 5,
     lastPrefixTokens: 20_000,
     lastNewTokens: 1_000,
     lastOutputTokens: 500,
-    lastMessageCount: 2,
     lastMessages: [{ role: "user", content: "a" }, { role: "assistant", content: "b" }],
+    lastRequestedTier: "sonnet",
     ...overrides,
   };
 }
@@ -82,7 +161,7 @@ test("on reset, adopts the argmax choice immediately with no margin or break-eve
     confidence: 0.34,
     probabilities: { haiku: 0.34, sonnet: 0.33, opus: 0.17, fable: 0.16 },
   };
-  const resetState = state({ lastMessages: [], lastMessageCount: 0 });
+  const resetState = state({ lastMessages: [] });
   const decision = decide(classification, resetState, currentMessages, DEFAULT_PRICING);
   assert.deepEqual(decision, { kind: "downgraded-on-reset", to: "haiku" });
 });
@@ -93,7 +172,7 @@ test("on reset, adopts the argmax choice immediately, upgrade direction", () => 
     confidence: 0.4,
     probabilities: { haiku: 0.1, sonnet: 0.3, opus: 0.4, fable: 0.2 },
   };
-  const resetState = state({ lastMessages: [], lastMessageCount: 0 });
+  const resetState = state({ lastMessages: [] });
   const decision = decide(classification, resetState, currentMessages, DEFAULT_PRICING);
   assert.deepEqual(decision, { kind: "upgraded-on-reset", to: "opus" });
 });
@@ -104,7 +183,7 @@ test("on reset, holds when the argmax choice equals the current tier", () => {
     confidence: 0.4,
     probabilities: { haiku: 0.2, sonnet: 0.4, opus: 0.3, fable: 0.1 },
   };
-  const resetState = state({ lastMessages: [], lastMessageCount: 0 });
+  const resetState = state({ lastMessages: [] });
   const decision = decide(classification, resetState, currentMessages, DEFAULT_PRICING);
   assert.deepEqual(decision, { kind: "held" });
 });
