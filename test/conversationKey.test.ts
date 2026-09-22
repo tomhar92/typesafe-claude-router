@@ -14,7 +14,7 @@ test("initializes state on first use and returns the same object on reuse", () =
   assert.equal(second.currentTier, "sonnet");
 });
 
-test("two different sockets never share state", () => {
+test("two different sockets never share state, and each gets a distinct connectionId", () => {
   const a = getOrInitState({}, "sonnet");
   const b = getOrInitState({}, "sonnet");
   updateState(
@@ -25,6 +25,7 @@ test("two different sockets never share state", () => {
   );
   assert.equal(a.currentTier, "haiku");
   assert.equal(b.currentTier, "sonnet");
+  assert.notEqual(a.connectionId, b.connectionId);
 });
 
 test("updateState advances tier, turn count, prefix/new/output tokens, and tracked messages", () => {
@@ -46,6 +47,16 @@ test("updateState advances tier, turn count, prefix/new/output tokens, and track
   assert.equal(state.lastPrefixTokens, 2000);
   assert.equal(state.lastNewTokens, 1000);
   assert.equal(state.lastOutputTokens, 500);
-  assert.equal(state.lastMessageCount, 2);
   assert.deepEqual(state.lastMessages, messages);
+});
+
+test("turnsOnCurrentTier accumulates while the tier stays the same and resets on a real change", () => {
+  const state = getOrInitState({}, "sonnet");
+  const usage = { input_tokens: 10, output_tokens: 5, cache_creation_input_tokens: 0, cache_read_input_tokens: 0 };
+  updateState(state, "sonnet", usage, []);
+  assert.equal(state.turnsOnCurrentTier, 1);
+  updateState(state, "sonnet", usage, []);
+  assert.equal(state.turnsOnCurrentTier, 2);
+  updateState(state, "haiku", usage, []);
+  assert.equal(state.turnsOnCurrentTier, 1);
 });

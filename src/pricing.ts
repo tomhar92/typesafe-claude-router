@@ -35,3 +35,27 @@ export function tierForModel(pricing: PricingConfig, model: string): Tier | null
   );
   return entry ? entry[0] : null;
 }
+
+/**
+ * The one place that turns token counts into a dollar cost. `breakEven.ts`
+ * used to duplicate this arithmetic in its own `turnCost` helper (with a
+ * `cacheField` parameter picking read vs. write) - same formula, two
+ * places to get subtly out of sync.
+ */
+export function computeCostUsd(
+  pricing: PricingConfig,
+  tier: Tier,
+  inputTokens: number,
+  outputTokens: number,
+  cacheCreationTokens: number,
+  cacheReadTokens: number
+): number {
+  const rates = pricing.rates[tier];
+  return (
+    (inputTokens * rates.inputPerMTok +
+      outputTokens * rates.outputPerMTok +
+      cacheCreationTokens * rates.cacheWritePerMTok +
+      cacheReadTokens * rates.cacheReadPerMTok) /
+    1_000_000
+  );
+}

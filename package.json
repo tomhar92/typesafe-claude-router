@@ -4,12 +4,16 @@
   "description": "Cache-aware, TypeSafe-driven model tier router for Claude Code",
   "type": "module",
   "license": "MIT",
+  "engines": {
+    "node": ">=18.0.0"
+  },
   "bin": {
     "typesafe-claude-router-report": "./dist/bin/report.js"
   },
   "scripts": {
     "build": "tsc -p .",
-    "test": "node --import tsx --test test/**/*.test.ts",
+    "typecheck": "tsc -p tsconfig.test.json",
+    "test": "npm run typecheck && node --import tsx --test test/**/*.test.ts",
     "start": "tsx src/server.ts",
     "report": "tsx bin/report.ts"
   },

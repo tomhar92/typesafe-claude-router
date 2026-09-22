@@ -1,5 +1,6 @@
 #!/usr/bin/env node
 import { readLedger, type LedgerLine } from "../src/ledger.js";
+import { isMainModule } from "../src/isMainModule.js";
 
 export interface Summary {
   turns: number;
@@ -7,6 +8,7 @@ export interface Summary {
   downgraded: number;
   upgradedOnReset: number;
   suggested: number;
+  classifierUnavailable: number;
   totalActualUsd: number;
   totalCounterfactualUsd: number;
   deltaUsd: number;
@@ -26,6 +28,7 @@ export function summarize(lines: LedgerLine[]): Summary {
     ).length,
     upgradedOnReset: lines.filter((l) => l.decision === "upgraded-on-reset").length,
     suggested: lines.filter((l) => l.decision === "upgrade-suggested").length,
+    classifierUnavailable: lines.filter((l) => l.decision === "classifier-unavailable").length,
     totalActualUsd,
     totalCounterfactualUsd,
     deltaUsd: totalActualUsd - totalCounterfactualUsd,
@@ -48,6 +51,11 @@ function main(): void {
   console.log(
     `  held: ${s.held}, downgraded: ${s.downgraded}, upgraded-on-reset: ${s.upgradedOnReset}, upgrade-suggested: ${s.suggested}`
   );
+  if (s.classifierUnavailable > 0) {
+    console.log(
+      `  classifier-unavailable: ${s.classifierUnavailable} (TypeSafe errored/timed out - router held by default, not by policy, on these turns)`
+    );
+  }
   console.log(`Actual cost:         $${s.totalActualUsd.toFixed(4)}`);
   console.log(`No-routing baseline: $${s.totalCounterfactualUsd.toFixed(4)}`);
   console.log(
@@ -55,6 +63,6 @@ function main(): void {
   );
 }
 
-if (import.meta.url === `file://${process.argv[1]}`) {
+if (isMainModule(import.meta.url)) {
   main();
 }

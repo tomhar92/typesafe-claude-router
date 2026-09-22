@@ -3,10 +3,11 @@ import { getOrInitState, updateState } from "./conversationKey.js";
 import { decide } from "./policy.js";
 import { computeMargins } from "./margins.js";
 import { classifyTurn, type ClassifyInput } from "./classify.js";
-import { DEFAULT_PRICING, tierForModel } from "./pricing.js";
-import { appendLedgerLine, computeCostUsd } from "./ledger.js";
+import { DEFAULT_PRICING, tierForModel, computeCostUsd } from "./pricing.js";
+import { appendLedgerLine } from "./ledger.js";
 import { buildUpgradeNoteBlock } from "./upgradeNote.js";
 import { UsageAccumulator } from "./usage.js";
+import { isMainModule } from "./isMainModule.js";
 import type { PricingConfig, Tier, ClassifyResult } from "./types.js";
 
 export interface ServerOptions {
@@ -16,6 +17,21 @@ export interface ServerOptions {
   pricing?: PricingConfig;
   classify?: (input: ClassifyInput) => Promise<ClassifyResult | null>;
 }
+
+// Headers that describe the *transport* framing of the upstream response
+// rather than its content. Forwarding them verbatim is wrong here: fetch
+// (undici) auto-decompresses gzip/deflate/br bodies but leaves the
+// original `content-encoding`/`content-length` in `response.headers`, so
+// blindly copying them makes our response claim to be compressed (or a
+// stale byte length) when the bytes we actually wrote are plain and a
+// different length. `transfer-encoding`/`connection` are similarly
+// per-hop, not per-resource, and Node's http server manages them itself.
+const HOP_BY_HOP_RESPONSE_HEADERS = [
+  "content-encoding",
+  "content-length",
+  "transfer-encoding",
+  "connection",
+];
 
 function readBody(req: IncomingMessage): Promise<Buffer> {
   return new Promise((resolve, reject) => {
@@ -53,7 +69,25 @@ export async function handleMessages(
   const classify = options.classify ?? classifyTurn;
 
   const bodyBuf = await readBody(req);
-  const body = JSON.parse(bodyBuf.toString("utf8"));
+  let body: any;
+  try {
+    body = JSON.parse(bodyBuf.toString("utf8"));
+  } catch {
+    res.writeHead(400, { "content-type": "application/json" });
+    res.end(JSON.stringify({ error: "invalid_request_body" }));
+    return;
+  }
+  // JSON.parse accepts plenty of syntactically-valid bodies that aren't a
+  // Messages API request object - `null`, `"foo"`, `42`, `[]`. Those all
+  // slip past the try/catch above and then throw on `body.model` below
+  // (or silently proceed with nonsense), so reject them here with the same
+  // clean 400 rather than letting them fall through to the 502 catch-all.
+  if (body === null || typeof body !== "object" || Array.isArray(body)) {
+    res.writeHead(400, { "content-type": "application/json" });
+    res.end(JSON.stringify({ error: "invalid_request_body" }));
+    return;
+  }
+
   const requestedModel: string = body.model;
   const requestedTier: Tier = tierForModel(pricing, requestedModel) ?? "sonnet";
   const state = getOrInitState(req.socket, requestedTier);
@@ -64,8 +98,28 @@ export async function handleMessages(
   // silently sticking to the router's last pick below. The cache is being
   // rebuilt by the model change regardless, so there's no switch-tax reason
   // to fight it.
+  //
+  // The mutation below is provisional, for this turn's decide()/margin
+  // computation only - it's restored right after targetTier is settled
+  // (see below). The *permanent* currentTier transition, and the
+  // turnsOnCurrentTier reset/accumulate bookkeeping that goes with it, must
+  // go through updateState()'s own comparison against the real pre-turn
+  // tier, and only once we know the turn actually succeeded (the
+  // upstreamResponse.ok guard further down). Mutating state.currentTier
+  // here and leaving it mutated would both double up that bookkeeping and,
+  // on a failed upstream call, permanently poison routing state for a turn
+  // that never happened.
+  //
+  // Likewise, state.lastRequestedTier is only committed once we know the
+  // turn succeeded (alongside currentTier, further down). If a manual
+  // switch's first attempt gets rate-limited or otherwise fails, Claude
+  // Code will resend the same requested model on retry - committing
+  // lastRequestedTier here unconditionally would mark that switch as
+  // "already seen" after the failed attempt, so the retry would silently
+  // stop being recognized as a manual change and fall back to pure
+  // policy-driven routing instead of honoring it.
+  const previousTier = state.currentTier;
   const userChangedModel = requestedTier !== state.lastRequestedTier;
-  state.lastRequestedTier = requestedTier;
   if (userChangedModel) {
     state.currentTier = requestedTier;
   }
@@ -77,6 +131,11 @@ export async function handleMessages(
     recentMessages: messages.slice(-6),
     latestUserMessage,
   });
+  if (!classification) {
+    console.warn(
+      "typesafe-claude-router: classifier unavailable this turn (TypeSafe error or timeout) - holding current tier"
+    );
+  }
 
   const marginInfo = classification
     ? computeMargins(classification.probabilities, state.currentTier)
@@ -99,13 +158,25 @@ export async function handleMessages(
   // turn and paid the cache-rebuild tax again going back.
   const targetTier: Tier = isSwitch ? decision.to : state.currentTier;
 
+  // Undo the provisional mutation above now that this turn's decision is
+  // locked in. state.currentTier goes back to reflecting reality (the tier
+  // the last *successful* turn actually ended on) until updateState()
+  // applies the real transition below.
+  state.currentTier = previousTier;
+
   let outgoingModel = requestedModel;
   if (mode === "live") {
     outgoingModel = pricing.modelAlias[targetTier];
     body.model = outgoingModel;
   }
 
-  if (decision.kind === "upgrade-suggested" && messages.length > 0) {
+  // Shadow mode's whole contract is "never change what actually happens,
+  // only log what would have happened." Injecting this note into the
+  // conversation content the model sees is a real behavior change (it can
+  // change what the model says to the user), so it's gated to live mode
+  // like the model-field rewrite above - otherwise "shadow mode" was
+  // quietly not shadow for this one feature.
+  if (mode === "live" && decision.kind === "upgrade-suggested" && messages.length > 0) {
     const last = messages[messages.length - 1];
     if (last.role === "user") {
       const note = buildUpgradeNoteBlock(decision.to, decision.estimatedCostUsd);
@@ -130,7 +201,9 @@ export async function handleMessages(
     body: JSON.stringify(body),
   });
 
-  res.writeHead(upstreamResponse.status, Object.fromEntries(upstreamResponse.headers.entries()));
+  const responseHeaders = Object.fromEntries(upstreamResponse.headers.entries());
+  for (const header of HOP_BY_HOP_RESPONSE_HEADERS) delete responseHeaders[header];
+  res.writeHead(upstreamResponse.status, responseHeaders);
 
   const actualModel = mode === "live" ? outgoingModel : requestedModel;
   const actualTier = tierForModel(pricing, actualModel) ?? targetTier;
@@ -149,56 +222,81 @@ export async function handleMessages(
   res.end();
   const usage = usageAccumulator.finalize();
 
-  updateState(
-    state,
-    actualTier,
-    {
-      input_tokens: usage.inputTokens,
-      output_tokens: usage.outputTokens,
-      cache_creation_input_tokens: usage.cacheCreationTokens,
-      cache_read_input_tokens: usage.cacheReadTokens,
-    },
-    messages
-  );
+  // A non-2xx upstream response (rate limit, auth failure, malformed
+  // request, ...) didn't deliver a real turn - the conversation didn't
+  // advance and there's no trustworthy usage to log. Recording it as if it
+  // had would poison both the sticky-tier state and the cost report.
+  if (upstreamResponse.ok) {
+    state.lastRequestedTier = requestedTier;
+    updateState(
+      state,
+      actualTier,
+      {
+        input_tokens: usage.inputTokens,
+        output_tokens: usage.outputTokens,
+        cache_creation_input_tokens: usage.cacheCreationTokens,
+        cache_read_input_tokens: usage.cacheReadTokens,
+      },
+      messages
+    );
 
-  const actualCostUsd = computeCostUsd(
-    pricing,
-    actualTier,
-    usage.inputTokens,
-    usage.outputTokens,
-    usage.cacheCreationTokens,
-    usage.cacheReadTokens
-  );
-  const counterfactualNoRoutingCostUsd = computeCostUsd(
-    pricing,
-    requestedTier,
-    usage.inputTokens,
-    usage.outputTokens,
-    usage.cacheCreationTokens,
-    usage.cacheReadTokens
-  );
+    const actualCostUsd = computeCostUsd(
+      pricing,
+      actualTier,
+      usage.inputTokens,
+      usage.outputTokens,
+      usage.cacheCreationTokens,
+      usage.cacheReadTokens
+    );
 
-  appendLedgerLine(ledgerPath, {
-    ts: new Date().toISOString(),
-    conversationKey: "socket",
-    probabilities: classification?.probabilities ?? ({} as Record<Tier, number>),
-    downgradeMargin: marginInfo?.downgradeMargin ?? 0,
-    upgradeMargin: marginInfo?.upgradeMargin ?? 0,
-    decision: decision.kind,
-    resetDetected:
-      decision.kind === "downgraded-on-reset" || decision.kind === "upgraded-on-reset",
-    suggestedUpgradeTo: decision.kind === "upgrade-suggested" ? decision.to : null,
-    suggestedUpgradeCostUsd:
-      decision.kind === "upgrade-suggested" ? decision.estimatedCostUsd : null,
-    actualModel,
-    actualTier,
-    inputTokens: usage.inputTokens,
-    outputTokens: usage.outputTokens,
-    cacheCreationTokens: usage.cacheCreationTokens,
-    cacheReadTokens: usage.cacheReadTokens,
-    actualCostUsd,
-    counterfactualNoRoutingCostUsd,
-  });
+    // The counterfactual answers "what would this turn have cost with no
+    // router at all", i.e. staying on `requestedTier` forever. A plain
+    // "downgraded" decision is the one case where *this turn's* cache-write
+    // tokens exist only because the router itself just switched models - in
+    // the no-router world the session never left `requestedTier`, so that
+    // prefix would still have been warm (a cache *read*, at requestedTier's
+    // much cheaper rate) rather than rebuilt. Reset-triggered switches don't
+    // get this treatment: the reset (session start, `/clear`, `/compact`)
+    // invalidates the cache regardless of the router, so the no-router world
+    // pays that same rebuild too.
+    const routerCausedRebuild = decision.kind === "downgraded";
+    const counterfactualCacheReadTokens = routerCausedRebuild
+      ? usage.cacheReadTokens + usage.cacheCreationTokens
+      : usage.cacheReadTokens;
+    const counterfactualCacheCreationTokens = routerCausedRebuild ? 0 : usage.cacheCreationTokens;
+    const counterfactualNoRoutingCostUsd = computeCostUsd(
+      pricing,
+      requestedTier,
+      usage.inputTokens,
+      usage.outputTokens,
+      counterfactualCacheCreationTokens,
+      counterfactualCacheReadTokens
+    );
+
+    appendLedgerLine(ledgerPath, {
+      ts: new Date().toISOString(),
+      conversationKey: state.connectionId,
+      probabilities: classification?.probabilities ?? ({} as Record<Tier, number>),
+      confidence: classification?.confidence ?? null,
+      downgradeMargin: marginInfo?.downgradeMargin ?? 0,
+      upgradeMargin: marginInfo?.upgradeMargin ?? 0,
+      decision: classification ? decision.kind : "classifier-unavailable",
+      resetDetected:
+        decision.kind === "downgraded-on-reset" || decision.kind === "upgraded-on-reset",
+      suggestedUpgradeTo: decision.kind === "upgrade-suggested" ? decision.to : null,
+      suggestedUpgradeCostUsd:
+        decision.kind === "upgrade-suggested" ? decision.estimatedCostUsd : null,
+      actualModel,
+      actualTier,
+      turnsOnCurrentTier: state.turnsOnCurrentTier,
+      inputTokens: usage.inputTokens,
+      outputTokens: usage.outputTokens,
+      cacheCreationTokens: usage.cacheCreationTokens,
+      cacheReadTokens: usage.cacheReadTokens,
+      actualCostUsd,
+      counterfactualNoRoutingCostUsd,
+    });
+  }
 }
 
 export function createProxyServer(options: ServerOptions = {}) {
@@ -206,8 +304,16 @@ export function createProxyServer(options: ServerOptions = {}) {
     if (req.method === "POST" && req.url === "/v1/messages") {
       handleMessages(req, res, options).catch((err) => {
         console.error("router error", err);
-        if (!res.headersSent) res.writeHead(502);
-        res.end(JSON.stringify({ error: "router_proxy_error" }));
+        if (!res.headersSent) {
+          res.writeHead(502, { "content-type": "application/json" });
+          res.end(JSON.stringify({ error: "router_proxy_error" }));
+          return;
+        }
+        // Headers (and possibly a partial SSE body) already went out.
+        // Appending an error JSON blob after them would corrupt the
+        // stream instead of signaling failure - destroy the connection so
+        // the client sees a clearly incomplete response.
+        res.destroy(err instanceof Error ? err : new Error(String(err)));
       });
       return;
     }
@@ -216,10 +322,17 @@ export function createProxyServer(options: ServerOptions = {}) {
   });
 }
 
-if (import.meta.url === `file://${process.argv[1]}`) {
+if (isMainModule(import.meta.url)) {
   const port = Number(process.env.PORT ?? 8787);
-  createProxyServer().listen(port, () => {
+  // Default to loopback-only: this proxy holds no auth of its own (it
+  // relies on whatever ANTHROPIC_API_KEY the client already sends
+  // through), so binding to all interfaces would let anyone else on the
+  // network trigger paid TypeSafe classifier calls and grow the ledger
+  // file through this machine. Set HOST to opt into listening more
+  // broadly (e.g. inside a container).
+  const host = process.env.HOST ?? "127.0.0.1";
+  createProxyServer().listen(port, host, () => {
     const mode = process.env.ROUTER_MODE === "live" ? "live" : "shadow";
-    console.log(`typesafe-claude-router listening on http://localhost:${port} (mode=${mode})`);
+    console.log(`typesafe-claude-router listening on http://${host}:${port} (mode=${mode})`);
   });
 }

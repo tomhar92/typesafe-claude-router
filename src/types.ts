@@ -21,12 +21,14 @@ export interface ClassifyResult {
 }
 
 export interface ConversationState {
+  /** Stable per-socket id for this conversation, used as the ledger's
+   * `conversationKey` so turns from concurrent sessions can be told apart. */
+  connectionId: string;
   currentTier: Tier;
   turnsOnCurrentTier: number;
   lastPrefixTokens: number;
   lastNewTokens: number;
   lastOutputTokens: number;
-  lastMessageCount: number;
   lastMessages: unknown[];
   /** The tier Claude Code itself requested on the most recent turn, used to
    * detect a manual `/model` change so the router doesn't fight it. */
