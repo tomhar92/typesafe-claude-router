@@ -131,7 +131,7 @@ export async function handleMessages(
     return;
   }
 
-  const requestedModel: string = body.model;
+  const requestedModel: unknown = body.model;
   const requestedTier = tierForModel(pricing, requestedModel);
 
   // An unrecognized model is not a routing decision we are able to make:
@@ -156,7 +156,7 @@ export async function handleMessages(
         resetDetected: false,
         suggestedUpgradeTo: null,
         suggestedUpgradeCostUsd: null,
-        actualModel: requestedModel,
+        actualModel: String(requestedModel ?? ""),
         actualTier: null,
         turnsOnCurrentTier: 0,
         inputTokens: usage.inputTokens,
@@ -170,6 +170,10 @@ export async function handleMessages(
     return;
   }
 
+  // tierForModel only returns non-null for a non-empty string model, so
+  // everything past this guard can treat the request's model as a plain
+  // string rather than the `unknown` it started as.
+  const requestedModelString = requestedModel as string;
   const state = getOrInitState(req.socket, requestedTier);
 
   // Claude Code re-sends whatever tier it thinks the session is on. If that
@@ -244,7 +248,7 @@ export async function handleMessages(
   // applies the real transition below.
   state.currentTier = previousTier;
 
-  let outgoingModel = requestedModel;
+  let outgoingModel = requestedModelString;
   if (mode === "live") {
     outgoingModel = pricing.modelAlias[targetTier];
     body.model = outgoingModel;
@@ -269,7 +273,7 @@ export async function handleMessages(
 
   const { response: upstreamResponse, usage } = await forwardAndStream(req, res, body, upstream);
 
-  const actualModel = mode === "live" ? outgoingModel : requestedModel;
+  const actualModel = mode === "live" ? outgoingModel : requestedModelString;
   const actualTier = tierForModel(pricing, actualModel) ?? targetTier;
 
   // A non-2xx upstream response (rate limit, auth failure, malformed

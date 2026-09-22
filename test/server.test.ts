@@ -698,6 +698,46 @@ test("forwards an unrecognized model untouched and never calls the classifier", 
   fake.close();
 });
 
+test("a missing model field routes through the unknown-model path with a safe actualModel", async () => {
+  const fake = await withFakeUpstream(() => ({
+    status: 200,
+    usage: { input_tokens: 10, output_tokens: 5, cache_creation_input_tokens: 0, cache_read_input_tokens: 0 },
+    text: "ok",
+  }));
+  const ledgerPath = join(mkdtempSync(join(tmpdir(), "ledger-")), "ledger.jsonl");
+  let classifyCalls = 0;
+  const router = createProxyServer({
+    upstream: fake.url,
+    mode: "live",
+    ledgerPath,
+    classify: async () => {
+      classifyCalls += 1;
+      return { choice: "haiku", confidence: 0.9, probabilities: { haiku: 0.9, sonnet: 0.05, opus: 0.03, fable: 0.02 } };
+    },
+  });
+  const port = await listen(router);
+
+  // No `model` field at all - JSON.parse leaves body.model as `undefined`,
+  // which is not a string, so tierForModel must treat it as unresolved
+  // rather than the actualModel field silently disappearing from the
+  // persisted JSONL (JSON.stringify drops undefined-valued properties).
+  const response = await fetch(`http://127.0.0.1:${port}/v1/messages`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ messages: [{ role: "user", content: "hi" }] }),
+  });
+  await response.text();
+
+  assert.equal(classifyCalls, 0);
+  const lines = readLedger(ledgerPath);
+  assert.equal(lines[0].decision, "unknown-model");
+  assert.equal(lines[0].actualTier, null);
+  assert.equal(lines[0].actualModel, "");
+
+  router.close();
+  fake.close();
+});
+
 test("a dated opus model is priced as opus, not as the sonnet fallback", async () => {
   const fake = await withFakeUpstream(() => ({
     status: 200,
