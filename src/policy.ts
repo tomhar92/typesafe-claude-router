@@ -3,8 +3,15 @@ import { detectReset } from "./reset.js";
 import { computeMargins } from "./margins.js";
 import { breakEvenTurns, switchTax } from "./breakEven.js";
 
-export const MARGIN_THRESHOLD = 0.1;
-export const STICKY_ASSUMPTION = 3;
+function envNumber(name: string, fallback: number): number {
+  const raw = process.env[name];
+  if (raw === undefined || raw === "") return fallback;
+  const parsed = Number(raw);
+  return Number.isFinite(parsed) ? parsed : fallback;
+}
+
+export const MARGIN_THRESHOLD = envNumber("ROUTER_MARGIN_THRESHOLD", 0.1);
+export const STICKY_ASSUMPTION = envNumber("ROUTER_STICKY_ASSUMPTION", 3);
 
 export function decide(
   classification: ClassifyResult,

@@ -6,8 +6,9 @@ import type { LedgerLine } from "../src/ledger.js";
 function line(overrides: Partial<LedgerLine>): LedgerLine {
   return {
     ts: new Date().toISOString(),
-    conversationKey: "socket",
+    conversationKey: "conn-1",
     probabilities: { haiku: 0.25, sonnet: 0.25, opus: 0.25, fable: 0.25 },
+    confidence: 0.5,
     downgradeMargin: 0,
     upgradeMargin: 0,
     decision: "held",
@@ -16,6 +17,7 @@ function line(overrides: Partial<LedgerLine>): LedgerLine {
     suggestedUpgradeCostUsd: null,
     actualModel: "claude-sonnet-5",
     actualTier: "sonnet",
+    turnsOnCurrentTier: 1,
     inputTokens: 0,
     outputTokens: 0,
     cacheCreationTokens: 0,
@@ -50,4 +52,16 @@ test("summarize handles an empty ledger", () => {
   assert.equal(summary.turns, 0);
   assert.equal(summary.totalActualUsd, 0);
   assert.equal(summary.totalCounterfactualUsd, 0);
+});
+
+test("summarize counts classifier-unavailable turns separately from a policy-driven hold", () => {
+  const lines: LedgerLine[] = [
+    line({ decision: "held" }),
+    line({ decision: "classifier-unavailable", probabilities: {} as LedgerLine["probabilities"], confidence: null }),
+    line({ decision: "classifier-unavailable", probabilities: {} as LedgerLine["probabilities"], confidence: null }),
+  ];
+  const summary = summarize(lines);
+  assert.equal(summary.turns, 3);
+  assert.equal(summary.held, 1);
+  assert.equal(summary.classifierUnavailable, 2);
 });

@@ -29,13 +29,23 @@ This router is built around that constraint:
 
 Full design rationale: `docs/superpowers/specs/2026-09-19-typesafe-router-design.md`.
 
+## What leaves your machine
+
+Every turn, the last ~6 messages of the conversation (including tool
+results and file contents pasted into the session) are sent to TypeSafe's
+API for classification, in addition to the normal Anthropic API traffic.
+If that's not acceptable for a given session or codebase, don't point
+`ANTHROPIC_BASE_URL` at this proxy for it.
+
 ## Setup
+
+Requires Node 18+ (uses the global `fetch`/`Headers` APIs).
 
 ```bash
 npm install
 export TYPESAFE_API_KEY=...      # from typesafe.ai
 export ANTHROPIC_API_KEY=...     # your normal Anthropic key/subscription auth
-npm start                        # starts the proxy on :8787 in shadow mode
+npm start                        # starts the proxy on 127.0.0.1:8787 in shadow mode
 ```
 
 In another terminal, point Claude Code at it:
@@ -69,7 +79,16 @@ ROUTER_MODE=live npm start
 | `ROUTER_MODE` | `shadow` or `live` | `shadow` |
 | `ROUTER_LEDGER_PATH` | Where turn-by-turn cost data is logged | `./router-ledger.jsonl` |
 | `PORT` | Local proxy port | `8787` |
+| `HOST` | Interface the proxy binds to | `127.0.0.1` |
+| `ROUTER_MARGIN_THRESHOLD` | Minimum probability margin before a downgrade/upgrade is even considered | `0.1` |
+| `ROUTER_STICKY_ASSUMPTION` | Max break-even turns for an automatic downgrade to be worth it | `3` |
 | `ANTHROPIC_DEFAULT_HAIKU_MODEL` / `_SONNET_` / `_OPUS_` / `_FABLE_MODEL` | Which real model each tier maps to | see `src/pricing.ts` |
+
+`HOST` defaults to loopback-only: the proxy has no auth of its own (it
+relies on whatever `ANTHROPIC_API_KEY` the client sends through), so
+binding to all interfaces would let anyone on the network trigger paid
+TypeSafe calls through your machine. Only widen it (e.g. `HOST=0.0.0.0`
+in a container) if you understand that tradeoff.
 
 Pricing (`src/pricing.ts`) reflects research done 2026-09-19 and **will
 drift** — check current Claude API pricing before trusting real spend
@@ -84,7 +103,17 @@ numbers from the report.
   own environment before relying on the sticky/break-even logic.
 - The upgrade-suggestion note is injected as conversation content for the
   model to relay, not a UI element — it depends on the model choosing to
-  mention it.
+  mention it. It's only injected in `live` mode, to keep `shadow` mode's
+  "never changes what actually happens" contract honest; it also perturbs
+  the cache prefix for the following turn, a small extra cost beyond the
+  estimate it reports.
+- If TypeSafe errors or times out on a turn, the router holds the current
+  tier and logs `decision: "classifier-unavailable"` (distinct from a
+  genuine policy-driven `held`) so a broken API key doesn't quietly look
+  like normal routing in the report.
+- Non-2xx upstream responses (rate limits, auth failures, ...) are still
+  forwarded to the client, but are not logged to the ledger or folded into
+  routing state, since no real turn completed.
 - No multi-provider routing (see `claude-code-router` for that), no
   Bedrock/Vertex/Azure gateway support, no UI beyond the CLI report.
 

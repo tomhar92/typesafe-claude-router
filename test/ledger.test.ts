@@ -9,8 +9,9 @@ import { DEFAULT_PRICING } from "../src/pricing.js";
 function line(overrides: Partial<LedgerLine> = {}): LedgerLine {
   return {
     ts: new Date().toISOString(),
-    conversationKey: "socket",
+    conversationKey: "conn-1",
     probabilities: { haiku: 0.1, sonnet: 0.8, opus: 0.05, fable: 0.05 },
+    confidence: 0.8,
     downgradeMargin: -0.05,
     upgradeMargin: -0.75,
     decision: "held",
@@ -19,6 +20,7 @@ function line(overrides: Partial<LedgerLine> = {}): LedgerLine {
     suggestedUpgradeCostUsd: null,
     actualModel: DEFAULT_PRICING.modelAlias.sonnet,
     actualTier: "sonnet",
+    turnsOnCurrentTier: 1,
     inputTokens: 1000,
     outputTokens: 500,
     cacheCreationTokens: 0,

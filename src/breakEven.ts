@@ -1,23 +1,5 @@
+import { computeCostUsd } from "./pricing.js";
 import type { PricingConfig, Tier } from "./types.js";
-
-type CacheField = "cacheReadPerMTok" | "cacheWritePerMTok";
-
-function turnCost(
-  tier: Tier,
-  cacheTokens: number,
-  cacheField: CacheField,
-  newTokens: number,
-  outputTokens: number,
-  pricing: PricingConfig
-): number {
-  const rates = pricing.rates[tier];
-  return (
-    (cacheTokens * rates[cacheField] +
-      newTokens * rates.inputPerMTok +
-      outputTokens * rates.outputPerMTok) /
-    1_000_000
-  );
-}
 
 export function switchTax(
   lastPrefixTokens: number,
@@ -27,21 +9,24 @@ export function switchTax(
   candidateTier: Tier,
   pricing: PricingConfig
 ): number {
-  const switchTurnCost = turnCost(
+  // Switching pays the candidate tier's cache-*write* rate on the prefix
+  // (the cache is being rebuilt from scratch on the new model).
+  const switchTurnCost = computeCostUsd(
+    pricing,
     candidateTier,
-    lastPrefixTokens,
-    "cacheWritePerMTok",
     lastNewTokens,
     lastOutputTokens,
-    pricing
+    lastPrefixTokens,
+    0
   );
-  const stayTurnCost = turnCost(
+  // Staying keeps hitting the cache: current tier's *read* rate.
+  const stayTurnCost = computeCostUsd(
+    pricing,
     currentTier,
-    lastPrefixTokens,
-    "cacheReadPerMTok",
     lastNewTokens,
     lastOutputTokens,
-    pricing
+    0,
+    lastPrefixTokens
   );
   return switchTurnCost - stayTurnCost;
 }
@@ -62,21 +47,21 @@ export function breakEvenTurns(
     candidateTier,
     pricing
   );
-  const stayTurnCost = turnCost(
+  const stayTurnCost = computeCostUsd(
+    pricing,
     currentTier,
-    lastPrefixTokens,
-    "cacheReadPerMTok",
     lastNewTokens,
     lastOutputTokens,
-    pricing
+    0,
+    lastPrefixTokens
   );
-  const candidateSteadyCost = turnCost(
+  const candidateSteadyCost = computeCostUsd(
+    pricing,
     candidateTier,
-    lastPrefixTokens,
-    "cacheReadPerMTok",
     lastNewTokens,
     lastOutputTokens,
-    pricing
+    0,
+    lastPrefixTokens
   );
   const perTurnSavings = stayTurnCost - candidateSteadyCost;
   if (perTurnSavings <= 0) return Infinity;

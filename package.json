@@ -4,6 +4,9 @@
   "description": "Cache-aware, TypeSafe-driven model tier router for Claude Code",
   "type": "module",
   "license": "MIT",
+  "engines": {
+    "node": ">=18.0.0"
+  },
   "bin": {
     "typesafe-claude-router-report": "./dist/bin/report.js"
   },
