@@ -66,3 +66,16 @@ test("summarize counts classifier-unavailable turns separately from a policy-dri
   assert.equal(summary.held, 1);
   assert.equal(summary.classifierUnavailable, 2);
 });
+
+test("summarize counts unknown-model turns and treats their unpriced cost as zero", () => {
+  const lines: LedgerLine[] = [
+    line({ decision: "held", actualCostUsd: 0.01, counterfactualNoRoutingCostUsd: 0.01 }),
+    line({ decision: "unknown-model", actualCostUsd: null, counterfactualNoRoutingCostUsd: null }),
+  ];
+  const summary = summarize(lines);
+  assert.equal(summary.turns, 2);
+  assert.equal(summary.unknownModel, 1);
+  assert.ok(Math.abs(summary.totalActualUsd - 0.01) < 1e-9);
+  assert.ok(Math.abs(summary.totalCounterfactualUsd - 0.01) < 1e-9);
+  assert.ok(Math.abs(summary.deltaUsd) < 1e-9);
+});
