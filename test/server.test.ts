@@ -661,6 +661,80 @@ test("gates the upgrade-suggested note to live mode, so shadow mode never change
   fake.close();
 });
 
+test("forwards an unrecognized model untouched and never calls the classifier", async () => {
+  const fake = await withFakeUpstream(() => ({
+    status: 200,
+    usage: { input_tokens: 10, output_tokens: 5, cache_creation_input_tokens: 0, cache_read_input_tokens: 0 },
+    text: "ok",
+  }));
+  const ledgerPath = join(mkdtempSync(join(tmpdir(), "ledger-")), "ledger.jsonl");
+  let classifyCalls = 0;
+  const router = createProxyServer({
+    upstream: fake.url,
+    mode: "live",
+    ledgerPath,
+    classify: async () => {
+      classifyCalls += 1;
+      return { choice: "haiku", confidence: 0.9, probabilities: { haiku: 0.9, sonnet: 0.05, opus: 0.03, fable: 0.02 } };
+    },
+  });
+  const port = await listen(router);
+
+  const response = await fetch(`http://127.0.0.1:${port}/v1/messages`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ model: "gpt-4o", messages: [{ role: "user", content: "hi" }] }),
+  });
+  await response.text();
+
+  assert.equal(fake.getLastBody().model, "gpt-4o");
+  assert.equal(classifyCalls, 0);
+  const lines = readLedger(ledgerPath);
+  assert.equal(lines[0].decision, "unknown-model");
+  assert.equal(lines[0].actualTier, null);
+  assert.equal(lines[0].actualCostUsd, null);
+
+  router.close();
+  fake.close();
+});
+
+test("a dated opus model is priced as opus, not as the sonnet fallback", async () => {
+  const fake = await withFakeUpstream(() => ({
+    status: 200,
+    usage: { input_tokens: 1000, output_tokens: 500, cache_creation_input_tokens: 0, cache_read_input_tokens: 20000 },
+    text: "ok",
+  }));
+  const ledgerPath = join(mkdtempSync(join(tmpdir(), "ledger-")), "ledger.jsonl");
+  const router = createProxyServer({
+    upstream: fake.url,
+    mode: "shadow",
+    ledgerPath,
+    classify: async () => ({
+      choice: "opus",
+      confidence: 0.8,
+      probabilities: { haiku: 0.05, sonnet: 0.1, opus: 0.8, fable: 0.05 },
+    }),
+  });
+  const port = await listen(router);
+
+  const response = await fetch(`http://127.0.0.1:${port}/v1/messages`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({
+      model: "claude-opus-5-20260101",
+      messages: [{ role: "user", content: "hello" }],
+    }),
+  });
+  await response.text();
+
+  const lines = readLedger(ledgerPath);
+  assert.equal(lines[0].actualTier, "opus");
+  assert.equal(lines[0].actualModel, "claude-opus-5-20260101");
+
+  router.close();
+  fake.close();
+});
+
 test("counterfactual reclassifies a router-caused rebuild as a cache read, not a cache write, at the no-router tier", async () => {
   // Two turns on one connection: turn 1 establishes currentTier=opus via a
   // reset (classifier says opus), turn 2 is a genuine mid-session
@@ -737,11 +811,11 @@ test("counterfactual reclassifies a router-caused rebuild as a cache read, not a
   const expectedCounterfactual = (100 * 2 + 50 * 10 + 0 * 2.5 + 3000 * 0.2) / 1_000_000;
 
   assert.ok(
-    Math.abs(lines[1].actualCostUsd - expectedActual) < 1e-9,
+    Math.abs(lines[1].actualCostUsd! - expectedActual) < 1e-9,
     `expected actualCostUsd ~${expectedActual}, got ${lines[1].actualCostUsd}`
   );
   assert.ok(
-    Math.abs(lines[1].counterfactualNoRoutingCostUsd - expectedCounterfactual) < 1e-9,
+    Math.abs(lines[1].counterfactualNoRoutingCostUsd! - expectedCounterfactual) < 1e-9,
     `expected counterfactualNoRoutingCostUsd ~${expectedCounterfactual}, got ${lines[1].counterfactualNoRoutingCostUsd}`
   );
 

@@ -5,6 +5,7 @@ import type { LedgerLine } from "../src/ledger.js";
 
 function line(overrides: Partial<LedgerLine>): LedgerLine {
   return {
+    v: 2,
     ts: new Date().toISOString(),
     conversationKey: "conn-1",
     probabilities: { haiku: 0.25, sonnet: 0.25, opus: 0.25, fable: 0.25 },
