@@ -39,7 +39,7 @@ If that's not acceptable for a given session or codebase, don't point
 
 ## Setup
 
-Requires Node 18+ (uses the global `fetch`/`Headers` APIs).
+Requires Node 20+ (the TypeSafe SDK requires it; the proxy itself uses the global `fetch`/`Headers` APIs).
 
 ```bash
 npm install
