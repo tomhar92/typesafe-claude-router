@@ -2,15 +2,15 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
-import { decide, envNumber } from "../src/policy.js";
+import { decide, envNumber, DEFAULT_LIMITS, type PolicyLimits } from "../src/policy.js";
 import { DEFAULT_PRICING } from "../src/pricing.js";
-import type { ConversationState, ClassifyResult } from "../src/types.js";
+import type { ConversationState, ClassifyResult, Tier } from "../src/types.js";
 
 const thresholdsFixture = fileURLToPath(
   new URL("./fixtures/policy-thresholds.ts", import.meta.url)
 );
 
-function readThresholds(env: Record<string, string> = {}): { MARGIN_THRESHOLD: number; STICKY_ASSUMPTION: number } {
+function readThresholds(env: Record<string, string> = {}): { MARGIN_THRESHOLD: number; STICKY_ASSUMPTION: number; DEFAULT_LIMITS: PolicyLimits } {
   const output = execFileSync(process.execPath, ["--import", "tsx", thresholdsFixture], {
     encoding: "utf8",
     env: { ...process.env, ...env },
@@ -31,6 +31,15 @@ test("MARGIN_THRESHOLD/STICKY_ASSUMPTION pick up ROUTER_MARGIN_THRESHOLD/ROUTER_
   });
   assert.equal(thresholds.MARGIN_THRESHOLD, 0.25);
   assert.equal(thresholds.STICKY_ASSUMPTION, 5);
+});
+
+test("DEFAULT_LIMITS picks up ROUTER_MAX_TIER and ROUTER_RESET_CONFIDENCE_FLOOR", () => {
+  const thresholds = readThresholds({
+    ROUTER_MAX_TIER: "opus",
+    ROUTER_RESET_CONFIDENCE_FLOOR: "0.7",
+  });
+  assert.equal(thresholds.DEFAULT_LIMITS.maxTier, "opus");
+  assert.equal(thresholds.DEFAULT_LIMITS.resetConfidenceFloor, 0.7);
 });
 
 test("envNumber: uses the fallback when the env var is unset", () => {
@@ -162,7 +171,11 @@ test("on reset, adopts the argmax choice immediately with no margin or break-eve
     probabilities: { haiku: 0.34, sonnet: 0.33, opus: 0.17, fable: 0.16 },
   };
   const resetState = state({ lastMessages: [] });
-  const decision = decide(classification, resetState, currentMessages, DEFAULT_PRICING);
+  const decision = decide(classification, resetState, currentMessages, DEFAULT_PRICING, {
+    ...DEFAULT_LIMITS,
+    marginThreshold: 0,
+    resetConfidenceFloor: 0,
+  });
   assert.deepEqual(decision, { kind: "downgraded-on-reset", to: "haiku" });
 });
 
@@ -173,7 +186,11 @@ test("on reset, adopts the argmax choice immediately, upgrade direction", () => 
     probabilities: { haiku: 0.1, sonnet: 0.3, opus: 0.4, fable: 0.2 },
   };
   const resetState = state({ lastMessages: [] });
-  const decision = decide(classification, resetState, currentMessages, DEFAULT_PRICING);
+  const decision = decide(classification, resetState, currentMessages, DEFAULT_PRICING, {
+    ...DEFAULT_LIMITS,
+    marginThreshold: 0,
+    resetConfidenceFloor: 0,
+  });
   assert.deepEqual(decision, { kind: "upgraded-on-reset", to: "opus" });
 });
 
@@ -213,4 +230,52 @@ test("when both clear the threshold, the larger margin wins (upgrade)", () => {
   const decision = decide(classification, state(), currentMessages, DEFAULT_PRICING);
   assert.equal(decision.kind, "upgrade-suggested");
   if (decision.kind === "upgrade-suggested") assert.equal(decision.to, "opus");
+});
+
+const LIMITS = {
+  marginThreshold: 0.1,
+  stickyAssumption: 3,
+  minTier: "haiku" as const,
+  maxTier: "fable" as const,
+  resetConfidenceFloor: 0.5,
+};
+
+test("a reset holds when the classifier is not confident enough to spend on a switch", () => {
+  const resetState = state({ currentTier: "sonnet", lastMessages: [] });
+  const classification: ClassifyResult = {
+    choice: "fable",
+    confidence: 0.34,
+    probabilities: { haiku: 0.1, sonnet: 0.22, opus: 0.34, fable: 0.34 },
+  };
+  const decision = decide(classification, resetState, [{ role: "user", content: "go" }], DEFAULT_PRICING, LIMITS);
+  assert.equal(decision.kind, "held");
+});
+
+test("ROUTER_MAX_TIER caps a reset-window upgrade at the ceiling", () => {
+  const resetState = state({ currentTier: "sonnet", lastMessages: [] });
+  const classification: ClassifyResult = {
+    choice: "fable",
+    confidence: 0.9,
+    probabilities: { haiku: 0.02, sonnet: 0.03, opus: 0.15, fable: 0.8 },
+  };
+  const decision = decide(classification, resetState, [{ role: "user", content: "go" }], DEFAULT_PRICING, {
+    ...LIMITS,
+    maxTier: "opus",
+  });
+  assert.equal(decision.kind, "upgraded-on-reset");
+  assert.equal(decision.kind === "upgraded-on-reset" && decision.to, "opus");
+});
+
+test("ROUTER_MAX_TIER keeps fable out of the non-reset upgrade candidates", () => {
+  const resetState = state({ currentTier: "sonnet", lastMessages: [{ role: "user", content: "go" }] });
+  const classification: ClassifyResult = {
+    choice: "fable",
+    confidence: 0.9,
+    probabilities: { haiku: 0.02, sonnet: 0.03, opus: 0.05, fable: 0.9 },
+  };
+  const decision = decide(classification, resetState, [{ role: "user", content: "go" }], DEFAULT_PRICING, {
+    ...LIMITS,
+    maxTier: "opus",
+  });
+  assert.equal(decision.kind, "held");
 });

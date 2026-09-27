@@ -16,11 +16,14 @@ function strongest(tiers: Tier[], probabilities: Record<Tier, number>): Tier | n
 
 export function computeMargins(
   probabilities: Record<Tier, number>,
-  currentTier: Tier
+  currentTier: Tier,
+  allowed: { min: Tier; max: Tier } = { min: "haiku", max: "fable" }
 ): MarginResult {
   const currentIndex = TIER_ORDER.indexOf(currentTier);
-  const cheaper = TIER_ORDER.slice(0, currentIndex) as Tier[];
-  const pricier = TIER_ORDER.slice(currentIndex + 1) as Tier[];
+  const minIndex = TIER_ORDER.indexOf(allowed.min);
+  const maxIndex = TIER_ORDER.indexOf(allowed.max);
+  const cheaper = TIER_ORDER.slice(minIndex, Math.min(currentIndex, maxIndex + 1)) as Tier[];
+  const pricier = TIER_ORDER.slice(Math.max(currentIndex + 1, minIndex), maxIndex + 1) as Tier[];
 
   const downgradeCandidate = strongest(cheaper, probabilities);
   const upgradeCandidate = strongest(pricier, probabilities);
