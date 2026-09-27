@@ -13,7 +13,7 @@
   "scripts": {
     "build": "tsc -p .",
     "typecheck": "tsc -p tsconfig.test.json",
-    "test": "npm run typecheck && node --import tsx --test test/**/*.test.ts",
+    "test": "npm run typecheck && node --import tsx --test $(find test -name '*.test.ts')",
     "start": "tsx src/server.ts",
     "report": "tsx bin/report.ts"
   },
