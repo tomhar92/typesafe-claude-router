@@ -109,6 +109,42 @@ test("holds tier, passes model through untouched, and logs real usage", async ()
   fake.close();
 });
 
+test("live mode leaves an exact model pin alone when the decision is held", async () => {
+  const fake = await withFakeUpstream(() => ({
+    status: 200,
+    usage: { input_tokens: 10, output_tokens: 5, cache_creation_input_tokens: 0, cache_read_input_tokens: 0 },
+    text: "ok",
+  }));
+  const ledgerPath = join(mkdtempSync(join(tmpdir(), "ledger-")), "ledger.jsonl");
+  const router = createProxyServer({
+    upstream: fake.url,
+    mode: "live",
+    ledgerPath,
+    classify: async () => ({
+      choice: "opus",
+      confidence: 0.8,
+      probabilities: { haiku: 0.05, sonnet: 0.1, opus: 0.8, fable: 0.05 },
+    }),
+  });
+  const port = await listen(router);
+
+  const response = await fetch(`http://127.0.0.1:${port}/v1/messages`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({
+      model: "claude-opus-5-20260101",
+      messages: [{ role: "user", content: "hello" }],
+    }),
+  });
+  await response.text();
+
+  assert.equal(fake.getLastBody().model, "claude-opus-5-20260101");
+  assert.equal(readLedger(ledgerPath)[0].decision, "held");
+
+  router.close();
+  fake.close();
+});
+
 test("rewrites the model field in live mode on a reset-window downgrade", async () => {
   const fake = await withFakeUpstream(() => ({
     status: 200,
