@@ -142,12 +142,34 @@ export async function handleMessages(
   // report can surface how often this happens. A run full of
   // `unknown-model` lines means the alias table needs a new entry.
   if (requestedTier === null) {
+    const state = getOrInitState(req.socket, "sonnet");
     const { response, usage } = await forwardAndStream(req, res, body, upstream);
     if (response.ok) {
+      // The turn still happened and still grew the conversation, even
+      // though we couldn't price or route it - lastMessages must move
+      // forward so the *next* turn's detectReset() compares against this
+      // turn's messages instead of the socket's initial `[]`. Leaving it
+      // stale made any turn right after an unknown-model turn look like a
+      // reset, which bypasses decide()'s margin/sticky/break-even
+      // safeguards. decisionTier is state.currentTier (unchanged) because
+      // this turn made no tier decision to record.
+      const messages: any[] = Array.isArray(body.messages) ? body.messages : [];
+      updateState(
+        state,
+        state.currentTier,
+        {
+          input_tokens: usage.inputTokens,
+          output_tokens: usage.outputTokens,
+          cache_creation_input_tokens: usage.cacheCreationTokens,
+          cache_read_input_tokens: usage.cacheReadTokens,
+        },
+        messages
+      );
+
       appendLedgerLine(ledgerPath, {
         v: 2,
         ts: new Date().toISOString(),
-        conversationKey: getOrInitState(req.socket, "sonnet").connectionId,
+        conversationKey: state.connectionId,
         probabilities: {} as Record<Tier, number>,
         confidence: null,
         downgradeMargin: 0,

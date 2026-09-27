@@ -738,6 +738,65 @@ test("a missing model field routes through the unknown-model path with a safe ac
   fake.close();
 });
 
+test("an unknown-model turn does not make the next resolvable-model turn look like a reset", async () => {
+  const fake = await withFakeUpstream(() => ({
+    status: 200,
+    usage: { input_tokens: 10, output_tokens: 5, cache_creation_input_tokens: 0, cache_read_input_tokens: 0 },
+    text: "ok",
+  }));
+  const ledgerPath = join(mkdtempSync(join(tmpdir(), "ledger-")), "ledger.jsonl");
+  const router = createProxyServer({
+    upstream: fake.url,
+    mode: "live",
+    ledgerPath,
+    // A strong opus signal: if turn 2 is (wrongly) treated as a reset, decide()
+    // takes the reset branch and immediately returns "upgraded-on-reset" for
+    // any choice !== state.currentTier. If turn 2 is correctly recognized as a
+    // continuation, decide() instead runs the margin path, which never
+    // auto-switches upward - it can only produce "upgrade-suggested" or "held".
+    classify: async () => ({
+      choice: "opus",
+      confidence: 0.95,
+      probabilities: { haiku: 0.01, sonnet: 0.04, opus: 0.95, fable: 0.0 },
+    }),
+  });
+  const port = await listen(router);
+  const agent = new Agent({ keepAlive: true, maxSockets: 1 });
+
+  // Turn 1 on this connection uses a model with no resolvable tier - it
+  // must be forwarded untouched, but the conversation still grew.
+  const turn1Messages = [{ role: "user", content: "first turn on this connection" }];
+  await postOnSharedSocket(agent, port, { model: "gpt-4o", messages: turn1Messages });
+
+  // Turn 2 uses a real, resolvable model and simply continues the same
+  // conversation (a real superset of turn 1's messages) - this must not be
+  // mistaken for a `/clear`/`/compact` reset just because turn 1 took the
+  // unknown-model path.
+  const turn2Messages = [
+    ...turn1Messages,
+    { role: "assistant", content: "ok" },
+    { role: "user", content: "second turn" },
+  ];
+  await postOnSharedSocket(agent, port, {
+    model: DEFAULT_PRICING.modelAlias.sonnet,
+    messages: turn2Messages,
+  });
+
+  const lines = readLedger(ledgerPath);
+  assert.equal(lines.length, 2);
+  assert.equal(lines[0].decision, "unknown-model");
+  assert.notEqual(
+    lines[1].decision,
+    "upgraded-on-reset",
+    "turn 2 continues turn 1's conversation and must not be treated as a reset"
+  );
+  assert.equal(lines[1].resetDetected, false);
+
+  agent.destroy();
+  router.close();
+  fake.close();
+});
+
 test("a dated opus model is priced as opus, not as the sonnet fallback", async () => {
   const fake = await withFakeUpstream(() => ({
     status: 200,
