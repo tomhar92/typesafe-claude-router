@@ -33,6 +33,18 @@ const HOP_BY_HOP_RESPONSE_HEADERS = [
   "connection",
 ];
 
+function requestPath(url: string | undefined): string {
+  // Matching `req.url === "/v1/messages"` failed on any query string, so
+  // a client appending `?beta=true` got a 404 from a proxy whose whole
+  // job is to be transparent. Parse against a dummy origin so only the
+  // pathname decides routing.
+  try {
+    return new URL(url ?? "/", "http://router.invalid").pathname;
+  } catch {
+    return "/";
+  }
+}
+
 function readBody(req: IncomingMessage): Promise<Buffer> {
   return new Promise((resolve, reject) => {
     const chunks: Buffer[] = [];
@@ -50,7 +62,8 @@ async function forwardAndStream(
   req: IncomingMessage,
   res: ServerResponse,
   body: unknown,
-  upstream: string
+  upstream: string,
+  signal: AbortSignal
 ): Promise<{ response: Response; usage: UsageTotals }> {
   const upstreamHeaders = new Headers();
   for (const [key, value] of Object.entries(req.headers)) {
@@ -64,6 +77,7 @@ async function forwardAndStream(
     method: "POST",
     headers: upstreamHeaders,
     body: JSON.stringify(body),
+    signal,
   });
 
   const responseHeaders = Object.fromEntries(response.headers.entries());
@@ -85,6 +99,52 @@ async function forwardAndStream(
   return { response, usage: accumulator.finalize() };
 }
 
+// Anything this proxy does not reason about must reach Anthropic
+// unchanged. 404ing it made the router opaque for every endpoint except
+// the one it rewrites - notably /v1/messages/count_tokens, which the
+// client needs for context accounting.
+export async function passThroughRequest(
+  req: IncomingMessage,
+  res: ServerResponse,
+  options: ServerOptions,
+  signal: AbortSignal
+): Promise<void> {
+  const upstream = options.upstream ?? "https://api.anthropic.com";
+  const method = req.method ?? "GET";
+  const hasBody = method !== "GET" && method !== "HEAD";
+  const bodyBuffer = hasBody ? await readBody(req) : undefined;
+  const body = bodyBuffer ? new Uint8Array(bodyBuffer) : undefined;
+
+  const upstreamHeaders = new Headers();
+  for (const [key, value] of Object.entries(req.headers)) {
+    if (typeof value === "string") upstreamHeaders.set(key, value);
+    else if (Array.isArray(value)) upstreamHeaders.set(key, value.join(", "));
+  }
+  upstreamHeaders.delete("host");
+  upstreamHeaders.delete("content-length");
+
+  const response = await fetch(`${upstream}${req.url ?? "/"}`, {
+    method,
+    headers: upstreamHeaders,
+    body,
+    signal,
+  });
+
+  const responseHeaders = Object.fromEntries(response.headers.entries());
+  for (const header of HOP_BY_HOP_RESPONSE_HEADERS) delete responseHeaders[header];
+  res.writeHead(response.status, responseHeaders);
+
+  if (response.body) {
+    const reader = response.body.getReader();
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      res.write(value);
+    }
+  }
+  res.end();
+}
+
 function extractLatestUserText(messages: any[]): string {
   for (let i = messages.length - 1; i >= 0; i--) {
     const m = messages[i];
@@ -102,7 +162,8 @@ function extractLatestUserText(messages: any[]): string {
 export async function handleMessages(
   req: IncomingMessage,
   res: ServerResponse,
-  options: ServerOptions = {}
+  options: ServerOptions = {},
+  signal: AbortSignal = new AbortController().signal
 ): Promise<void> {
   const upstream = options.upstream ?? "https://api.anthropic.com";
   const mode = options.mode ?? (process.env.ROUTER_MODE === "live" ? "live" : "shadow");
@@ -143,7 +204,7 @@ export async function handleMessages(
   // `unknown-model` lines means the alias table needs a new entry.
   if (requestedTier === null) {
     const state = getOrInitState(req.socket, "sonnet");
-    const { response, usage } = await forwardAndStream(req, res, body, upstream);
+    const { response, usage } = await forwardAndStream(req, res, body, upstream, signal);
     if (response.ok) {
       // The turn still happened and still grew the conversation, even
       // though we couldn't price or route it - lastMessages must move
@@ -233,6 +294,7 @@ export async function handleMessages(
   const messages: any[] = Array.isArray(body.messages) ? body.messages : [];
   const latestUserMessage = extractLatestUserText(messages);
 
+  // TODO(PR 7): Pass signal to classify once classifyTurn supports it
   const classification = await classify({
     recentMessages: messages.slice(-6),
     latestUserMessage,
@@ -298,7 +360,7 @@ export async function handleMessages(
     }
   }
 
-  const { response: upstreamResponse, usage } = await forwardAndStream(req, res, body, upstream);
+  const { response: upstreamResponse, usage } = await forwardAndStream(req, res, body, upstream, signal);
 
   const actualModel = mode === "live" ? outgoingModel : requestedModelString;
   const actualTier = tierForModel(pricing, actualModel) ?? targetTier;
@@ -383,24 +445,31 @@ export async function handleMessages(
 
 export function createProxyServer(options: ServerOptions = {}) {
   return createServer((req, res) => {
-    if (req.method === "POST" && req.url === "/v1/messages") {
-      handleMessages(req, res, options).catch((err) => {
-        console.error("router error", err);
-        if (!res.headersSent) {
-          res.writeHead(502, { "content-type": "application/json" });
-          res.end(JSON.stringify({ error: "router_proxy_error" }));
-          return;
-        }
-        // Headers (and possibly a partial SSE body) already went out.
-        // Appending an error JSON blob after them would corrupt the
-        // stream instead of signaling failure - destroy the connection so
-        // the client sees a clearly incomplete response.
-        res.destroy(err instanceof Error ? err : new Error(String(err)));
-      });
-      return;
-    }
-    res.writeHead(404);
-    res.end();
+    // A client that hangs up mid-turn should not leave us paying for a
+    // generation nobody will read. `writableFinished` distinguishes a
+    // normal end-of-response close from a real disconnect.
+    const abort = new AbortController();
+    res.on("close", () => {
+      if (!res.writableFinished) abort.abort(new Error("client_disconnected"));
+    });
+
+    const routed = req.method === "POST" && requestPath(req.url) === "/v1/messages";
+    const run = routed
+      ? handleMessages(req, res, options, abort.signal)
+      : passThroughRequest(req, res, options, abort.signal);
+
+    run.catch((err) => {
+      // The client going away is not a proxy error - there is nobody left
+      // to tell, and the socket is already gone.
+      if (abort.signal.aborted) return;
+      console.error("router error", err);
+      if (!res.headersSent) {
+        res.writeHead(502, { "content-type": "application/json" });
+        res.end(JSON.stringify({ error: "router_proxy_error" }));
+        return;
+      }
+      res.destroy(err instanceof Error ? err : new Error(String(err)));
+    });
   });
 }
 

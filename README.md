@@ -37,6 +37,9 @@ API for classification, in addition to the normal Anthropic API traffic.
 If that's not acceptable for a given session or codebase, don't point
 `ANTHROPIC_BASE_URL` at this proxy for it.
 
+All non-`/v1/messages` traffic (such as `/v1/messages/count_tokens` for
+context accounting) is forwarded unmodified and unlogged to Anthropic.
+
 ## Setup
 
 Requires Node 20+ (the TypeSafe SDK requires it; the proxy itself uses the global `fetch`/`Headers` APIs).

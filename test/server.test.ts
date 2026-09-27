@@ -958,3 +958,98 @@ test("counterfactual reclassifies a router-caused rebuild as a cache read, not a
   router.close();
   fake.close();
 });
+
+test("routes /v1/messages even when the client appends a query string", async () => {
+  const fake = await withFakeUpstream(() => ({
+    status: 200,
+    usage: { input_tokens: 10, output_tokens: 5, cache_creation_input_tokens: 0, cache_read_input_tokens: 0 },
+    text: "ok",
+  }));
+  const ledgerPath = join(mkdtempSync(join(tmpdir(), "ledger-")), "ledger.jsonl");
+  const router = createProxyServer({
+    upstream: fake.url,
+    mode: "shadow",
+    ledgerPath,
+    classify: async () => ({
+      choice: "sonnet",
+      confidence: 0.8,
+      probabilities: { haiku: 0.05, sonnet: 0.8, opus: 0.1, fable: 0.05 },
+    }),
+  });
+  const port = await listen(router);
+
+  const response = await fetch(`http://127.0.0.1:${port}/v1/messages?beta=true`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({
+      model: DEFAULT_PRICING.modelAlias.sonnet,
+      messages: [{ role: "user", content: "hello" }],
+    }),
+  });
+  assert.equal(response.status, 200);
+  await response.text();
+  assert.equal(readLedger(ledgerPath).length, 1);
+
+  router.close();
+  fake.close();
+});
+
+test("forwards an endpoint it does not route instead of 404ing it", async () => {
+  const fake = createServer((req, res) => {
+    res.writeHead(200, { "content-type": "application/json" });
+    res.end(JSON.stringify({ path: req.url, method: req.method }));
+  });
+  const fakePort = await listen(fake);
+  const router = createProxyServer({ upstream: `http://127.0.0.1:${fakePort}`, mode: "shadow" });
+  const port = await listen(router);
+
+  const response = await fetch(`http://127.0.0.1:${port}/v1/messages/count_tokens`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ model: "claude-sonnet-5", messages: [] }),
+  });
+  assert.equal(response.status, 200);
+  assert.deepEqual(await response.json(), { path: "/v1/messages/count_tokens", method: "POST" });
+
+  router.close();
+  fake.close();
+});
+
+test("aborts the upstream request when the client hangs up mid-turn", async () => {
+  let upstreamAborted = false;
+  const servers: { router?: ReturnType<typeof createProxyServer>; fake?: ReturnType<typeof createServer> } = {};
+
+  const sawAbort = new Promise<void>((resolve) => {
+    servers.fake = createServer((upstreamReq, upstreamRes) => {
+      upstreamReq.on("close", () => {
+        if (!upstreamRes.writableFinished) {
+          upstreamAborted = true;
+          resolve();
+        }
+      });
+      // Never respond: hold the turn open so the client can hang up first.
+    });
+    listen(servers.fake).then(async (fakePort) => {
+      servers.router = createProxyServer({
+        upstream: `http://127.0.0.1:${fakePort}`,
+        mode: "shadow",
+        classify: async () => null,
+      });
+      const port = await listen(servers.router);
+      const controller = new AbortController();
+      const pending = fetch(`http://127.0.0.1:${port}/v1/messages`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ model: "claude-sonnet-5", messages: [{ role: "user", content: "hi" }] }),
+        signal: controller.signal,
+      }).catch(() => {});
+      setTimeout(() => controller.abort(), 50);
+      await pending;
+    });
+  });
+
+  await sawAbort;
+  assert.equal(upstreamAborted, true);
+  if (servers.router) servers.router.close();
+  if (servers.fake) servers.fake.close();
+});
