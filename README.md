@@ -82,7 +82,12 @@ ROUTER_MODE=live npm start
 | `HOST` | Interface the proxy binds to | `127.0.0.1` |
 | `ROUTER_MARGIN_THRESHOLD` | Minimum probability margin before a downgrade/upgrade is even considered | `0.1` |
 | `ROUTER_STICKY_ASSUMPTION` | Max break-even turns for an automatic downgrade to be worth it | `3` |
+| `ROUTER_MIN_TIER` | Cheapest tier the router can switch to | `haiku` |
+| `ROUTER_MAX_TIER` | Most expensive tier the router can switch to | `fable` |
+| `ROUTER_RESET_CONFIDENCE_FLOOR` | Minimum classifier confidence needed to switch on a reset | `0.5` |
 | `ANTHROPIC_DEFAULT_HAIKU_MODEL` / `_SONNET_` / `_OPUS_` / `_FABLE_MODEL` | Which real model each tier maps to | see `src/pricing.ts` |
+
+When enabling live mode for the first time, it is recommended to set `ROUTER_MAX_TIER=opus` to limit routing to the cheaper tiers while you verify the router is working as expected.
 
 `HOST` defaults to loopback-only: the proxy has no auth of its own (it
 relies on whatever `ANTHROPIC_API_KEY` the client sends through), so
