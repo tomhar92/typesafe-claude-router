@@ -271,7 +271,12 @@ export async function handleMessages(
   state.currentTier = previousTier;
 
   let outgoingModel = requestedModelString;
-  if (mode === "live") {
+  // Only touch the model when routing actually decided to move tiers. A
+  // `held` decision means "leave this turn alone"; rewriting anyway
+  // clobbers an exact pin (claude-opus-5-20260101) with the bare tier
+  // alias, silently changing which snapshot serves the turn while the
+  // ledger records it as a no-op.
+  if (mode === "live" && targetTier !== requestedTier) {
     outgoingModel = pricing.modelAlias[targetTier];
     body.model = outgoingModel;
   }
