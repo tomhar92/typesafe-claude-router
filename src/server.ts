@@ -1,6 +1,6 @@
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import { getOrInitState, updateState } from "./conversationKey.js";
-import { decide } from "./policy.js";
+import { decide, DEFAULT_LIMITS } from "./policy.js";
 import { computeMargins } from "./margins.js";
 import { classifyTurn, type ClassifyInput } from "./classify.js";
 import { DEFAULT_PRICING, tierForModel, computeCostUsd } from "./pricing.js";
@@ -244,7 +244,10 @@ export async function handleMessages(
   }
 
   const marginInfo = classification
-    ? computeMargins(classification.probabilities, state.currentTier)
+    ? computeMargins(classification.probabilities, state.currentTier, {
+        min: DEFAULT_LIMITS.minTier,
+        max: DEFAULT_LIMITS.maxTier,
+      })
     : null;
 
   const decision = classification

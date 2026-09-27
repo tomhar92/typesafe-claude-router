@@ -8,6 +8,12 @@ import { gzipSync } from "node:zlib";
 import { createProxyServer } from "../src/server.js";
 import { readLedger } from "../src/ledger.js";
 import { DEFAULT_PRICING } from "../src/pricing.js";
+import { execFileSync } from "node:child_process";
+import { fileURLToPath } from "node:url";
+
+const ledgerMarginsFixture = fileURLToPath(
+  new URL("./fixtures/server-ledger-margins.ts", import.meta.url)
+);
 
 function listen(server: import("node:http").Server): Promise<number> {
   return new Promise((resolve) => {
@@ -957,4 +963,17 @@ test("counterfactual reclassifies a router-caused rebuild as a cache read, not a
   agent.destroy();
   router.close();
   fake.close();
+});
+
+test("the ledger's logged upgradeMargin respects ROUTER_MAX_TIER instead of the haiku..fable default", () => {
+  const output = execFileSync(process.execPath, ["--import", "tsx", ledgerMarginsFixture], {
+    encoding: "utf8",
+    env: { ...process.env, ROUTER_MAX_TIER: "sonnet" },
+  });
+  const { upgradeMargin } = JSON.parse(output);
+  // With ROUTER_MAX_TIER=sonnet, opus is out of bounds, so there's no
+  // upgrade candidate left within the ceiling and the margin serializes
+  // as null (JSON has no -Infinity). The pre-fix version ignored the
+  // ceiling and reported opus's margin (0.75 - 0.15 = 0.6) instead.
+  assert.equal(upgradeMargin, null);
 });
