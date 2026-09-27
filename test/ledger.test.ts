@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync } from "node:fs";
+import { mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { appendLedgerLine, readLedger, computeCostUsd, type LedgerLine } from "../src/ledger.js";
@@ -8,6 +8,7 @@ import { DEFAULT_PRICING } from "../src/pricing.js";
 
 function line(overrides: Partial<LedgerLine> = {}): LedgerLine {
   return {
+    v: 2,
     ts: new Date().toISOString(),
     conversationKey: "conn-1",
     probabilities: { haiku: 0.1, sonnet: 0.8, opus: 0.05, fable: 0.05 },
@@ -44,6 +45,16 @@ test("appendLedgerLine writes JSONL that readLedger parses back", () => {
   assert.equal(lines.length, 2);
   assert.equal(lines[0].decision, "downgraded");
   assert.equal(lines[1].decision, "held");
+});
+
+test("readLedger defaults v to 2 on a pre-existing line that predates the unknown-model change", () => {
+  const path = join(mkdtempSync(join(tmpdir(), "ledger-")), "ledger.jsonl");
+  const { v: _v, ...withoutV } = line();
+  writeFileSync(path, JSON.stringify(withoutV) + "\n", "utf8");
+  const lines = readLedger(path);
+  assert.equal(lines.length, 1);
+  assert.equal(lines[0].v, 2);
+  assert.equal(lines[0].actualTier, "sonnet");
 });
 
 test("computeCostUsd sums input, output, cache-write, and cache-read tokens at their own rates", () => {

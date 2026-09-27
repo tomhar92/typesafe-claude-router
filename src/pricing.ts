@@ -29,11 +29,32 @@ export const DEFAULT_PRICING: PricingConfig = {
   },
 };
 
-export function tierForModel(pricing: PricingConfig, model: string): Tier | null {
-  const entry = (Object.entries(pricing.modelAlias) as [Tier, string][]).find(
-    ([, m]) => m === model
-  );
-  return entry ? entry[0] : null;
+// A model ID is a tier name embedded in a longer, versioned string:
+// `claude-opus-5-20260101`, `claude-3-5-haiku-20241022`,
+// `us.anthropic.claude-sonnet-5-v1:0`. Exact equality matched only the
+// bare aliases, so every real request from Claude Code resolved to null
+// and the caller's `?? "sonnet"` fallback quietly took over - which in
+// live mode rewrote Opus sessions to Sonnet and logged them as `held`.
+const TIER_PATTERNS: ReadonlyArray<readonly [Tier, RegExp]> = [
+  ["fable", /(^|[^a-z0-9])fable([^a-z0-9]|$)/],
+  ["opus", /(^|[^a-z0-9])opus([^a-z0-9]|$)/],
+  ["sonnet", /(^|[^a-z0-9])sonnet([^a-z0-9]|$)/],
+  ["haiku", /(^|[^a-z0-9])haiku([^a-z0-9]|$)/],
+];
+
+export function tierForModel(pricing: PricingConfig, model: unknown): Tier | null {
+  if (typeof model !== "string" || model.length === 0) return null;
+  // An exact alias wins over the patterns: it is the operator's own
+  // mapping, and ANTHROPIC_DEFAULT_*_MODEL may deliberately point a tier
+  // at a model whose name says otherwise.
+  for (const [tier, alias] of Object.entries(pricing.modelAlias) as [Tier, string][]) {
+    if (alias === model) return tier;
+  }
+  const normalized = model.toLowerCase();
+  for (const [tier, pattern] of TIER_PATTERNS) {
+    if (pattern.test(normalized)) return tier;
+  }
+  return null;
 }
 
 /**

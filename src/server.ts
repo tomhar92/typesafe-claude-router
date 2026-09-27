@@ -6,7 +6,7 @@ import { classifyTurn, type ClassifyInput } from "./classify.js";
 import { DEFAULT_PRICING, tierForModel, computeCostUsd } from "./pricing.js";
 import { appendLedgerLine } from "./ledger.js";
 import { buildUpgradeNoteBlock } from "./upgradeNote.js";
-import { UsageAccumulator } from "./usage.js";
+import { UsageAccumulator, type UsageTotals } from "./usage.js";
 import { isMainModule } from "./isMainModule.js";
 import type { PricingConfig, Tier, ClassifyResult } from "./types.js";
 
@@ -40,6 +40,49 @@ function readBody(req: IncomingMessage): Promise<Buffer> {
     req.on("end", () => resolve(Buffer.concat(chunks)));
     req.on("error", reject);
   });
+}
+
+// Both the routed path and the unknown-model bail-out path need to forward
+// the request and stream the response back untouched - factored out so
+// neither can drift from the other's header-stripping/decompression
+// handling.
+async function forwardAndStream(
+  req: IncomingMessage,
+  res: ServerResponse,
+  body: unknown,
+  upstream: string
+): Promise<{ response: Response; usage: UsageTotals }> {
+  const upstreamHeaders = new Headers();
+  for (const [key, value] of Object.entries(req.headers)) {
+    if (typeof value === "string") upstreamHeaders.set(key, value);
+    else if (Array.isArray(value)) upstreamHeaders.set(key, value.join(", "));
+  }
+  upstreamHeaders.delete("host");
+  upstreamHeaders.delete("content-length");
+
+  const response = await fetch(`${upstream}/v1/messages`, {
+    method: "POST",
+    headers: upstreamHeaders,
+    body: JSON.stringify(body),
+  });
+
+  const responseHeaders = Object.fromEntries(response.headers.entries());
+  for (const header of HOP_BY_HOP_RESPONSE_HEADERS) delete responseHeaders[header];
+  res.writeHead(response.status, responseHeaders);
+
+  const accumulator = new UsageAccumulator();
+  if (response.body) {
+    const reader = response.body.getReader();
+    const decoder = new TextDecoder();
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      res.write(value);
+      accumulator.push(decoder.decode(value, { stream: true }));
+    }
+  }
+  res.end();
+  return { response, usage: accumulator.finalize() };
 }
 
 function extractLatestUserText(messages: any[]): string {
@@ -88,8 +131,71 @@ export async function handleMessages(
     return;
   }
 
-  const requestedModel: string = body.model;
-  const requestedTier: Tier = tierForModel(pricing, requestedModel) ?? "sonnet";
+  const requestedModel: unknown = body.model;
+  const requestedTier = tierForModel(pricing, requestedModel);
+
+  // An unrecognized model is not a routing decision we are able to make:
+  // we cannot price it, cannot compare tiers against it, and must not
+  // guess - the previous `?? "sonnet"` default is what made every dated
+  // model ID silently route as Sonnet. Forward it untouched, skip the
+  // (billed) classifier call entirely, and still record the turn so the
+  // report can surface how often this happens. A run full of
+  // `unknown-model` lines means the alias table needs a new entry.
+  if (requestedTier === null) {
+    const state = getOrInitState(req.socket, "sonnet");
+    const { response, usage } = await forwardAndStream(req, res, body, upstream);
+    if (response.ok) {
+      // The turn still happened and still grew the conversation, even
+      // though we couldn't price or route it - lastMessages must move
+      // forward so the *next* turn's detectReset() compares against this
+      // turn's messages instead of the socket's initial `[]`. Leaving it
+      // stale made any turn right after an unknown-model turn look like a
+      // reset, which bypasses decide()'s margin/sticky/break-even
+      // safeguards. decisionTier is state.currentTier (unchanged) because
+      // this turn made no tier decision to record.
+      const messages: any[] = Array.isArray(body.messages) ? body.messages : [];
+      updateState(
+        state,
+        state.currentTier,
+        {
+          input_tokens: usage.inputTokens,
+          output_tokens: usage.outputTokens,
+          cache_creation_input_tokens: usage.cacheCreationTokens,
+          cache_read_input_tokens: usage.cacheReadTokens,
+        },
+        messages
+      );
+
+      appendLedgerLine(ledgerPath, {
+        v: 2,
+        ts: new Date().toISOString(),
+        conversationKey: state.connectionId,
+        probabilities: {} as Record<Tier, number>,
+        confidence: null,
+        downgradeMargin: 0,
+        upgradeMargin: 0,
+        decision: "unknown-model",
+        resetDetected: false,
+        suggestedUpgradeTo: null,
+        suggestedUpgradeCostUsd: null,
+        actualModel: String(requestedModel ?? ""),
+        actualTier: null,
+        turnsOnCurrentTier: 0,
+        inputTokens: usage.inputTokens,
+        outputTokens: usage.outputTokens,
+        cacheCreationTokens: usage.cacheCreationTokens,
+        cacheReadTokens: usage.cacheReadTokens,
+        actualCostUsd: null,
+        counterfactualNoRoutingCostUsd: null,
+      });
+    }
+    return;
+  }
+
+  // tierForModel only returns non-null for a non-empty string model, so
+  // everything past this guard can treat the request's model as a plain
+  // string rather than the `unknown` it started as.
+  const requestedModelString = requestedModel as string;
   const state = getOrInitState(req.socket, requestedTier);
 
   // Claude Code re-sends whatever tier it thinks the session is on. If that
@@ -164,7 +270,7 @@ export async function handleMessages(
   // applies the real transition below.
   state.currentTier = previousTier;
 
-  let outgoingModel = requestedModel;
+  let outgoingModel = requestedModelString;
   if (mode === "live") {
     outgoingModel = pricing.modelAlias[targetTier];
     body.model = outgoingModel;
@@ -187,40 +293,10 @@ export async function handleMessages(
     }
   }
 
-  const upstreamHeaders = new Headers();
-  for (const [key, value] of Object.entries(req.headers)) {
-    if (typeof value === "string") upstreamHeaders.set(key, value);
-    else if (Array.isArray(value)) upstreamHeaders.set(key, value.join(", "));
-  }
-  upstreamHeaders.delete("host");
-  upstreamHeaders.delete("content-length");
+  const { response: upstreamResponse, usage } = await forwardAndStream(req, res, body, upstream);
 
-  const upstreamResponse = await fetch(`${upstream}/v1/messages`, {
-    method: "POST",
-    headers: upstreamHeaders,
-    body: JSON.stringify(body),
-  });
-
-  const responseHeaders = Object.fromEntries(upstreamResponse.headers.entries());
-  for (const header of HOP_BY_HOP_RESPONSE_HEADERS) delete responseHeaders[header];
-  res.writeHead(upstreamResponse.status, responseHeaders);
-
-  const actualModel = mode === "live" ? outgoingModel : requestedModel;
+  const actualModel = mode === "live" ? outgoingModel : requestedModelString;
   const actualTier = tierForModel(pricing, actualModel) ?? targetTier;
-
-  const usageAccumulator = new UsageAccumulator();
-  if (upstreamResponse.body) {
-    const reader = upstreamResponse.body.getReader();
-    const decoder = new TextDecoder();
-    for (;;) {
-      const { done, value } = await reader.read();
-      if (done) break;
-      res.write(value);
-      usageAccumulator.push(decoder.decode(value, { stream: true }));
-    }
-  }
-  res.end();
-  const usage = usageAccumulator.finalize();
 
   // A non-2xx upstream response (rate limit, auth failure, malformed
   // request, ...) didn't deliver a real turn - the conversation didn't
@@ -274,6 +350,7 @@ export async function handleMessages(
     );
 
     appendLedgerLine(ledgerPath, {
+      v: 2,
       ts: new Date().toISOString(),
       conversationKey: state.connectionId,
       probabilities: classification?.probabilities ?? ({} as Record<Tier, number>),

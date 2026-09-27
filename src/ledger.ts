@@ -4,6 +4,7 @@ import type { Tier } from "./types.js";
 export { computeCostUsd } from "./pricing.js";
 
 export interface LedgerLine {
+  v: 2;
   ts: string;
   conversationKey: string;
   probabilities: Record<Tier, number>;
@@ -14,14 +15,19 @@ export interface LedgerLine {
   upgradeMargin: number;
   /** One of the `Decision["kind"]` values from policy.ts, or
    * `"classifier-unavailable"` when TypeSafe errored/timed out and the
-   * router held by default rather than by policy - kept distinct so a
-   * broken API key doesn't silently masquerade as normal routing. */
+   * router held by default rather than by policy, or `"unknown-model"`
+   * when no tier could be resolved for the requested model - kept
+   * distinct so a broken API key or an unrecognized model doesn't
+   * silently masquerade as normal routing. */
   decision: string;
   resetDetected: boolean;
   suggestedUpgradeTo: Tier | null;
   suggestedUpgradeCostUsd: number | null;
   actualModel: string;
-  actualTier: Tier;
+  /** Null when the turn used a model no tier could be resolved for; the
+   * turn is still recorded so the report can count it, but it carries no
+   * cost because we have no rate card for that model. */
+  actualTier: Tier | null;
   /** How many consecutive turns (including this one) the conversation has
    * now spent on `actualTier`. */
   turnsOnCurrentTier: number;
@@ -29,8 +35,8 @@ export interface LedgerLine {
   outputTokens: number;
   cacheCreationTokens: number;
   cacheReadTokens: number;
-  actualCostUsd: number;
-  counterfactualNoRoutingCostUsd: number;
+  actualCostUsd: number | null;
+  counterfactualNoRoutingCostUsd: number | null;
 }
 
 export function appendLedgerLine(path: string, line: LedgerLine): void {
@@ -50,5 +56,11 @@ export function readLedger(path: string): LedgerLine[] {
   return readFileSync(path, "utf8")
     .split("\n")
     .filter((l) => l.trim().length > 0)
-    .map((l) => JSON.parse(l) as LedgerLine);
+    .map((l) => {
+      // Lines written before the unknown-model change carry no `v` and
+      // always have a tier and both costs. Defaulting here keeps an
+      // existing router-ledger.jsonl reportable instead of dropping it.
+      const parsed = JSON.parse(l) as Partial<LedgerLine>;
+      return { v: 2, ...parsed } as LedgerLine;
+    });
 }

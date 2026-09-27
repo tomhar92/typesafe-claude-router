@@ -9,15 +9,16 @@ export interface Summary {
   upgradedOnReset: number;
   suggested: number;
   classifierUnavailable: number;
+  unknownModel: number;
   totalActualUsd: number;
   totalCounterfactualUsd: number;
   deltaUsd: number;
 }
 
 export function summarize(lines: LedgerLine[]): Summary {
-  const totalActualUsd = lines.reduce((sum, l) => sum + l.actualCostUsd, 0);
+  const totalActualUsd = lines.reduce((sum, l) => sum + (l.actualCostUsd ?? 0), 0);
   const totalCounterfactualUsd = lines.reduce(
-    (sum, l) => sum + l.counterfactualNoRoutingCostUsd,
+    (sum, l) => sum + (l.counterfactualNoRoutingCostUsd ?? 0),
     0
   );
   return {
@@ -29,6 +30,7 @@ export function summarize(lines: LedgerLine[]): Summary {
     upgradedOnReset: lines.filter((l) => l.decision === "upgraded-on-reset").length,
     suggested: lines.filter((l) => l.decision === "upgrade-suggested").length,
     classifierUnavailable: lines.filter((l) => l.decision === "classifier-unavailable").length,
+    unknownModel: lines.filter((l) => l.decision === "unknown-model").length,
     totalActualUsd,
     totalCounterfactualUsd,
     deltaUsd: totalActualUsd - totalCounterfactualUsd,
@@ -54,6 +56,11 @@ function main(): void {
   if (s.classifierUnavailable > 0) {
     console.log(
       `  classifier-unavailable: ${s.classifierUnavailable} (TypeSafe errored/timed out - router held by default, not by policy, on these turns)`
+    );
+  }
+  if (s.unknownModel > 0) {
+    console.log(
+      `  unknown-model: ${s.unknownModel} (no tier resolved - forwarded untouched, not priced; add the model to modelAlias in src/pricing.ts)`
     );
   }
   console.log(`Actual cost:         $${s.totalActualUsd.toFixed(4)}`);

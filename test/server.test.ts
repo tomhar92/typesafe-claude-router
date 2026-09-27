@@ -661,6 +661,179 @@ test("gates the upgrade-suggested note to live mode, so shadow mode never change
   fake.close();
 });
 
+test("forwards an unrecognized model untouched and never calls the classifier", async () => {
+  const fake = await withFakeUpstream(() => ({
+    status: 200,
+    usage: { input_tokens: 10, output_tokens: 5, cache_creation_input_tokens: 0, cache_read_input_tokens: 0 },
+    text: "ok",
+  }));
+  const ledgerPath = join(mkdtempSync(join(tmpdir(), "ledger-")), "ledger.jsonl");
+  let classifyCalls = 0;
+  const router = createProxyServer({
+    upstream: fake.url,
+    mode: "live",
+    ledgerPath,
+    classify: async () => {
+      classifyCalls += 1;
+      return { choice: "haiku", confidence: 0.9, probabilities: { haiku: 0.9, sonnet: 0.05, opus: 0.03, fable: 0.02 } };
+    },
+  });
+  const port = await listen(router);
+
+  const response = await fetch(`http://127.0.0.1:${port}/v1/messages`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ model: "gpt-4o", messages: [{ role: "user", content: "hi" }] }),
+  });
+  await response.text();
+
+  assert.equal(fake.getLastBody().model, "gpt-4o");
+  assert.equal(classifyCalls, 0);
+  const lines = readLedger(ledgerPath);
+  assert.equal(lines[0].decision, "unknown-model");
+  assert.equal(lines[0].actualTier, null);
+  assert.equal(lines[0].actualCostUsd, null);
+
+  router.close();
+  fake.close();
+});
+
+test("a missing model field routes through the unknown-model path with a safe actualModel", async () => {
+  const fake = await withFakeUpstream(() => ({
+    status: 200,
+    usage: { input_tokens: 10, output_tokens: 5, cache_creation_input_tokens: 0, cache_read_input_tokens: 0 },
+    text: "ok",
+  }));
+  const ledgerPath = join(mkdtempSync(join(tmpdir(), "ledger-")), "ledger.jsonl");
+  let classifyCalls = 0;
+  const router = createProxyServer({
+    upstream: fake.url,
+    mode: "live",
+    ledgerPath,
+    classify: async () => {
+      classifyCalls += 1;
+      return { choice: "haiku", confidence: 0.9, probabilities: { haiku: 0.9, sonnet: 0.05, opus: 0.03, fable: 0.02 } };
+    },
+  });
+  const port = await listen(router);
+
+  // No `model` field at all - JSON.parse leaves body.model as `undefined`,
+  // which is not a string, so tierForModel must treat it as unresolved
+  // rather than the actualModel field silently disappearing from the
+  // persisted JSONL (JSON.stringify drops undefined-valued properties).
+  const response = await fetch(`http://127.0.0.1:${port}/v1/messages`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ messages: [{ role: "user", content: "hi" }] }),
+  });
+  await response.text();
+
+  assert.equal(classifyCalls, 0);
+  const lines = readLedger(ledgerPath);
+  assert.equal(lines[0].decision, "unknown-model");
+  assert.equal(lines[0].actualTier, null);
+  assert.equal(lines[0].actualModel, "");
+
+  router.close();
+  fake.close();
+});
+
+test("an unknown-model turn does not make the next resolvable-model turn look like a reset", async () => {
+  const fake = await withFakeUpstream(() => ({
+    status: 200,
+    usage: { input_tokens: 10, output_tokens: 5, cache_creation_input_tokens: 0, cache_read_input_tokens: 0 },
+    text: "ok",
+  }));
+  const ledgerPath = join(mkdtempSync(join(tmpdir(), "ledger-")), "ledger.jsonl");
+  const router = createProxyServer({
+    upstream: fake.url,
+    mode: "live",
+    ledgerPath,
+    // A strong opus signal: if turn 2 is (wrongly) treated as a reset, decide()
+    // takes the reset branch and immediately returns "upgraded-on-reset" for
+    // any choice !== state.currentTier. If turn 2 is correctly recognized as a
+    // continuation, decide() instead runs the margin path, which never
+    // auto-switches upward - it can only produce "upgrade-suggested" or "held".
+    classify: async () => ({
+      choice: "opus",
+      confidence: 0.95,
+      probabilities: { haiku: 0.01, sonnet: 0.04, opus: 0.95, fable: 0.0 },
+    }),
+  });
+  const port = await listen(router);
+  const agent = new Agent({ keepAlive: true, maxSockets: 1 });
+
+  // Turn 1 on this connection uses a model with no resolvable tier - it
+  // must be forwarded untouched, but the conversation still grew.
+  const turn1Messages = [{ role: "user", content: "first turn on this connection" }];
+  await postOnSharedSocket(agent, port, { model: "gpt-4o", messages: turn1Messages });
+
+  // Turn 2 uses a real, resolvable model and simply continues the same
+  // conversation (a real superset of turn 1's messages) - this must not be
+  // mistaken for a `/clear`/`/compact` reset just because turn 1 took the
+  // unknown-model path.
+  const turn2Messages = [
+    ...turn1Messages,
+    { role: "assistant", content: "ok" },
+    { role: "user", content: "second turn" },
+  ];
+  await postOnSharedSocket(agent, port, {
+    model: DEFAULT_PRICING.modelAlias.sonnet,
+    messages: turn2Messages,
+  });
+
+  const lines = readLedger(ledgerPath);
+  assert.equal(lines.length, 2);
+  assert.equal(lines[0].decision, "unknown-model");
+  assert.notEqual(
+    lines[1].decision,
+    "upgraded-on-reset",
+    "turn 2 continues turn 1's conversation and must not be treated as a reset"
+  );
+  assert.equal(lines[1].resetDetected, false);
+
+  agent.destroy();
+  router.close();
+  fake.close();
+});
+
+test("a dated opus model is priced as opus, not as the sonnet fallback", async () => {
+  const fake = await withFakeUpstream(() => ({
+    status: 200,
+    usage: { input_tokens: 1000, output_tokens: 500, cache_creation_input_tokens: 0, cache_read_input_tokens: 20000 },
+    text: "ok",
+  }));
+  const ledgerPath = join(mkdtempSync(join(tmpdir(), "ledger-")), "ledger.jsonl");
+  const router = createProxyServer({
+    upstream: fake.url,
+    mode: "shadow",
+    ledgerPath,
+    classify: async () => ({
+      choice: "opus",
+      confidence: 0.8,
+      probabilities: { haiku: 0.05, sonnet: 0.1, opus: 0.8, fable: 0.05 },
+    }),
+  });
+  const port = await listen(router);
+
+  const response = await fetch(`http://127.0.0.1:${port}/v1/messages`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({
+      model: "claude-opus-5-20260101",
+      messages: [{ role: "user", content: "hello" }],
+    }),
+  });
+  await response.text();
+
+  const lines = readLedger(ledgerPath);
+  assert.equal(lines[0].actualTier, "opus");
+  assert.equal(lines[0].actualModel, "claude-opus-5-20260101");
+
+  router.close();
+  fake.close();
+});
+
 test("counterfactual reclassifies a router-caused rebuild as a cache read, not a cache write, at the no-router tier", async () => {
   // Two turns on one connection: turn 1 establishes currentTier=opus via a
   // reset (classifier says opus), turn 2 is a genuine mid-session
@@ -737,11 +910,11 @@ test("counterfactual reclassifies a router-caused rebuild as a cache read, not a
   const expectedCounterfactual = (100 * 2 + 50 * 10 + 0 * 2.5 + 3000 * 0.2) / 1_000_000;
 
   assert.ok(
-    Math.abs(lines[1].actualCostUsd - expectedActual) < 1e-9,
+    Math.abs(lines[1].actualCostUsd! - expectedActual) < 1e-9,
     `expected actualCostUsd ~${expectedActual}, got ${lines[1].actualCostUsd}`
   );
   assert.ok(
-    Math.abs(lines[1].counterfactualNoRoutingCostUsd - expectedCounterfactual) < 1e-9,
+    Math.abs(lines[1].counterfactualNoRoutingCostUsd! - expectedCounterfactual) < 1e-9,
     `expected counterfactualNoRoutingCostUsd ~${expectedCounterfactual}, got ${lines[1].counterfactualNoRoutingCostUsd}`
   );
 
