@@ -1,4 +1,4 @@
-import { choice, TypeSafeClient } from "@typesafe-ai/sdk";
+import { choice, TypeSafeClient, type JsonValue } from "@typesafe-ai/sdk";
 import type { ClassifyResult, Tier } from "./types.js";
 
 let client: TypeSafeClient | undefined;
@@ -20,7 +20,7 @@ const TIER_CRITERIA = {
 };
 
 export interface ClassifyInput {
-  recentMessages: unknown[];
+  recentMessages: JsonValue[];
   latestUserMessage: string;
 }
 

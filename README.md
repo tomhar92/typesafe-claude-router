@@ -31,10 +31,13 @@ Full design rationale: `docs/superpowers/specs/2026-09-19-typesafe-router-design
 
 ## What leaves your machine
 
-Every turn, the last ~6 messages of the conversation (including tool
-results and file contents pasted into the session) are sent to TypeSafe's
+Every turn, the last 6 messages of the conversation (including tool
+results and file contents read into the session) are sent to TypeSafe's
 API for classification, in addition to the normal Anthropic API traffic.
-If that's not acceptable for a given session or codebase, don't point
+The payload is bounded: image blocks are omitted, each string is truncated
+at 2,000 characters, and the whole payload is capped at roughly 24,000
+characters. The caps reduce the exposure, they do not eliminate it - if
+that's not acceptable for a given session or codebase, don't point
 `ANTHROPIC_BASE_URL` at this proxy for it.
 
 All non-`/v1/messages` traffic (such as `/v1/messages/count_tokens` for

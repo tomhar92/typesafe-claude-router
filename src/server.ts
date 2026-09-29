@@ -5,6 +5,7 @@ import { computeMargins } from "./margins.js";
 import { classifyTurn, type ClassifyInput } from "./classify.js";
 import { DEFAULT_PRICING, tierForModel, computeCostUsd } from "./pricing.js";
 import { appendLedgerLine } from "./ledger.js";
+import { extractLatestUserText, sanitizeForClassifier } from "./classifyInput.js";
 import { buildUpgradeNoteBlock } from "./upgradeNote.js";
 import { UsageAccumulator, type UsageTotals } from "./usage.js";
 import { isMainModule } from "./isMainModule.js";
@@ -145,20 +146,6 @@ export async function passThroughRequest(
   res.end();
 }
 
-function extractLatestUserText(messages: any[]): string {
-  for (let i = messages.length - 1; i >= 0; i--) {
-    const m = messages[i];
-    if (m.role === "user") {
-      if (typeof m.content === "string") return m.content;
-      if (Array.isArray(m.content)) {
-        const textBlock = m.content.find((b: any) => b.type === "text");
-        return textBlock?.text ?? "";
-      }
-    }
-  }
-  return "";
-}
-
 export async function handleMessages(
   req: IncomingMessage,
   res: ServerResponse,
@@ -296,7 +283,7 @@ export async function handleMessages(
 
   // TODO(PR 7): Pass signal to classify once classifyTurn supports it
   const classification = await classify({
-    recentMessages: messages.slice(-6),
+    recentMessages: sanitizeForClassifier(messages.slice(-6)),
     latestUserMessage,
   });
   if (!classification) {
