@@ -1072,3 +1072,69 @@ test("the ledger's logged upgradeMargin respects ROUTER_MAX_TIER instead of the 
   // ceiling and reported opus's margin (0.75 - 0.15 = 0.6) instead.
   assert.equal(upgradeMargin, null);
 });
+
+test("rejects a request that carries browser provenance", async () => {
+  const router = createProxyServer({ mode: "shadow" });
+  const port = await listen(router);
+
+  const response = await fetch(`http://127.0.0.1:${port}/v1/messages`, {
+    method: "POST",
+    headers: { "content-type": "application/json", origin: "https://evil.example" },
+    body: JSON.stringify({ model: "claude-sonnet-5", messages: [] }),
+  });
+  assert.equal(response.status, 403);
+
+  router.close();
+});
+
+test("rejects a non-JSON content type on the routed endpoint", async () => {
+  const router = createProxyServer({ mode: "shadow" });
+  const port = await listen(router);
+
+  const response = await fetch(`http://127.0.0.1:${port}/v1/messages`, {
+    method: "POST",
+    headers: { "content-type": "text/plain" },
+    body: JSON.stringify({ model: "claude-sonnet-5", messages: [] }),
+  });
+  assert.equal(response.status, 415);
+
+  router.close();
+});
+
+test("rejects a body past the size cap instead of buffering it", async () => {
+  const router = createProxyServer({ mode: "shadow", maxBodyBytes: 1024 });
+  const port = await listen(router);
+
+  const response = await fetch(`http://127.0.0.1:${port}/v1/messages`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ model: "claude-sonnet-5", pad: "x".repeat(4096), messages: [] }),
+  }).catch(() => ({ status: 413 }) as { status: number });
+  assert.equal(response.status, 413);
+
+  router.close();
+});
+
+test("respects ROUTER_MAX_BODY_BYTES environment variable when no explicit option is passed", async () => {
+  const savedEnv = process.env.ROUTER_MAX_BODY_BYTES;
+  try {
+    process.env.ROUTER_MAX_BODY_BYTES = "1024";
+    const router = createProxyServer({ mode: "shadow" });
+    const port = await listen(router);
+
+    const response = await fetch(`http://127.0.0.1:${port}/v1/messages`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ model: "claude-sonnet-5", pad: "x".repeat(4096), messages: [] }),
+    }).catch(() => ({ status: 413 }) as { status: number });
+    assert.equal(response.status, 413);
+
+    router.close();
+  } finally {
+    if (savedEnv === undefined) {
+      delete process.env.ROUTER_MAX_BODY_BYTES;
+    } else {
+      process.env.ROUTER_MAX_BODY_BYTES = savedEnv;
+    }
+  }
+});
