@@ -32,3 +32,23 @@ test("has no upgrade candidate when current tier is already the priciest", () =>
   assert.equal(result.upgradeMargin, -Infinity);
   assert.equal(result.downgradeCandidate, "opus");
 });
+
+test("keeps the downgrade pool within the ceiling when current tier sits above it", () => {
+  const result = computeMargins(
+    { haiku: 0.1, sonnet: 0.2, opus: 0.6, fable: 0.1 },
+    "fable",
+    { min: "haiku", max: "sonnet" }
+  );
+  assert.equal(result.downgradeCandidate, "sonnet");
+  assert.equal(result.upgradeCandidate, null);
+});
+
+test("keeps the upgrade pool within the floor when current tier sits below it", () => {
+  const result = computeMargins(
+    { haiku: 0.1, sonnet: 0.6, opus: 0.2, fable: 0.1 },
+    "haiku",
+    { min: "opus", max: "fable" }
+  );
+  assert.equal(result.upgradeCandidate, "opus");
+  assert.equal(result.downgradeCandidate, null);
+});
