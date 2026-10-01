@@ -48,34 +48,66 @@ context accounting) is forwarded unmodified and unlogged to Anthropic.
 Requires Node 20+ (the TypeSafe SDK requires it; the proxy itself uses the global `fetch`/`Headers` APIs).
 
 ```bash
-npm install
 export TYPESAFE_API_KEY=...      # from typesafe.ai
-export ANTHROPIC_API_KEY=...     # your normal Anthropic key/subscription auth
-npm start                        # starts the proxy on 127.0.0.1:8787 in shadow mode
+npx typesafe-claude-router run -- claude
 ```
 
-In another terminal, point Claude Code at it:
+`run` starts the proxy on an ephemeral loopback port in shadow mode,
+launches the command after `--` with `ANTHROPIC_BASE_URL` pointed at it,
+and shuts the proxy down when the command exits. Your normal Anthropic
+auth is passed through untouched. The router refuses to start without
+`TYPESAFE_API_KEY` rather than quietly logging `classifier-unavailable`
+on every turn.
+
+The package is not published to npm yet. From a clone, run `npm install &&
+npm run build && npm link`, which puts the same `typesafe-claude-router`
+command on your PATH.
+
+### Keeping the proxy running
+
+If you want one long-lived proxy for several sessions, use two terminals:
+
+```bash
+typesafe-claude-router serve     # 127.0.0.1:8787, shadow mode (PORT/HOST to change)
+```
 
 ```bash
 export ANTHROPIC_BASE_URL=http://localhost:8787
 claude
 ```
 
+From a clone without `npm link`, `npm start` is the same as `serve`.
+
+### Reading the results
+
 Shadow mode (the default) never changes which model actually serves a
 turn — it only logs what it *would* have done. Watch `./router-ledger.jsonl`
 fill in during a real session, then run:
 
 ```bash
-npm run report -- ./router-ledger.jsonl
+typesafe-claude-router report            # or: report path/to/ledger.jsonl
 ```
 
-to see judged decisions and the real cost delta vs. never routing at all.
+The path defaults to `ROUTER_LEDGER_PATH`, then `./router-ledger.jsonl`.
+(From a clone: `npm run report`.)
 
-When you're ready to let it actually switch models:
+### Before enabling live mode
+
+Check, from a few real shadow-mode sessions, that:
+
+- the report shows no (or very few) `classifier-unavailable` turns;
+- there are no `unknown-model` turns, or you have added those models to
+  `modelAlias` in `src/pricing.ts`;
+- the decisions the router *would* have made look sensible for the work you
+  were actually doing.
+
+Then let it switch models, with a spend ceiling:
 
 ```bash
-ROUTER_MODE=live npm start
+ROUTER_MODE=live ROUTER_MAX_TIER=opus typesafe-claude-router run -- claude
 ```
+
+The router warns at startup if live mode has no `ROUTER_MAX_TIER`.
 
 ## Configuration
 
@@ -93,7 +125,7 @@ ROUTER_MODE=live npm start
 | `ROUTER_RESET_CONFIDENCE_FLOOR` | Minimum classifier confidence needed to switch on a reset | `0.5` |
 | `ANTHROPIC_DEFAULT_HAIKU_MODEL` / `_SONNET_` / `_OPUS_` / `_FABLE_MODEL` | Which real model each tier maps to | see `src/pricing.ts` |
 
-When enabling live mode for the first time, it is recommended to set `ROUTER_MAX_TIER=opus` to limit routing to the cheaper tiers while you verify the router is working as expected.
+When enabling live mode for the first time, set `ROUTER_MAX_TIER=opus` to limit routing to the cheaper tiers while you verify the router is working as expected.
 
 `HOST` defaults to loopback-only: the proxy has no auth of its own (it
 relies on whatever `ANTHROPIC_API_KEY` the client sends through), so

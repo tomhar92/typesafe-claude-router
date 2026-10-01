@@ -463,7 +463,38 @@ export function createProxyServer(options: ServerOptions = {}) {
   });
 }
 
+/**
+ * Configuration problems worth telling the operator about before the
+ * first turn rather than one warning line per turn forever. A missing
+ * TYPESAFE_API_KEY currently surfaces only as the TypeSafeClient
+ * constructor throwing inside classifyTurn's catch, which degrades into
+ * `classifier-unavailable` on every turn and looks like a flaky API.
+ */
+export function validateStartupConfig(env: NodeJS.ProcessEnv): string[] {
+  const problems: string[] = [];
+  if (!env.TYPESAFE_API_KEY?.trim()) {
+    problems.push(
+      "TYPESAFE_API_KEY is not set: every turn would log classifier-unavailable and the router would never route."
+    );
+  }
+  if (env.ROUTER_MODE === "live" && !env.ROUTER_MAX_TIER?.trim()) {
+    problems.push(
+      "ROUTER_MODE=live with no ROUTER_MAX_TIER: nothing caps autonomous spend. Set ROUTER_MAX_TIER=opus unless you mean to allow fable."
+    );
+  }
+  return problems;
+}
+
+/** Prints every startup problem and returns whether startup must abort.
+ * Only a missing key is fatal: a router that can never classify is
+ * useless, whereas a missing spend ceiling is the operator's call. */
+export function reportStartupProblems(env: NodeJS.ProcessEnv): boolean {
+  for (const problem of validateStartupConfig(env)) console.warn(`warning: ${problem}`);
+  return !env.TYPESAFE_API_KEY?.trim();
+}
+
 if (isMainModule(import.meta.url)) {
+  if (reportStartupProblems(process.env)) process.exit(1);
   const port = Number(process.env.PORT ?? 8787);
   // Default to loopback-only: this proxy holds no auth of its own (it
   // relies on whatever ANTHROPIC_API_KEY the client already sends

@@ -37,11 +37,20 @@ export function summarize(lines: LedgerLine[]): Summary {
   };
 }
 
-function main(): void {
-  const path = process.argv[2];
+const USAGE = "Usage: typesafe-claude-router-report [path-to-ledger.jsonl]";
+
+/** `--help` is the only way to get the usage line now: with a default
+ * path, the bare invocation is valid. */
+export function resolveLedgerPath(argv: string[], env: NodeJS.ProcessEnv): string | null {
+  if (argv.includes("--help") || argv.includes("-h")) return null;
+  return argv[0] ?? env.ROUTER_LEDGER_PATH ?? "./router-ledger.jsonl";
+}
+
+export function reportMain(argv: string[]): void {
+  const path = resolveLedgerPath(argv, process.env);
   if (!path) {
-    console.error("Usage: typesafe-claude-router-report <path-to-ledger.jsonl>");
-    process.exit(1);
+    console.log(USAGE);
+    return;
   }
   const lines = readLedger(path);
   if (lines.length === 0) {
@@ -71,5 +80,5 @@ function main(): void {
 }
 
 if (isMainModule(import.meta.url)) {
-  main();
+  reportMain(process.argv.slice(2));
 }
