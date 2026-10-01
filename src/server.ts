@@ -17,6 +17,16 @@ export interface ServerOptions {
   ledgerPath?: string;
   pricing?: PricingConfig;
   classify?: (input: ClassifyInput) => Promise<ClassifyResult | null>;
+  /** Hard cap on a buffered request body. Default 64 MiB, or
+   * ROUTER_MAX_BODY_BYTES. */
+  maxBodyBytes?: number;
+}
+
+export class BodyTooLargeError extends Error {
+  constructor() {
+    super("request body exceeds the configured limit");
+    this.name = "BodyTooLargeError";
+  }
 }
 
 // Headers that describe the *transport* framing of the upstream response
@@ -46,10 +56,40 @@ function requestPath(url: string | undefined): string {
   }
 }
 
-function readBody(req: IncomingMessage): Promise<Buffer> {
+const DEFAULT_MAX_BODY_BYTES = 67108864;
+
+function resolveMaxBodyBytes(options: ServerOptions): number {
+  if (options.maxBodyBytes !== undefined) {
+    return Number.isFinite(options.maxBodyBytes) && options.maxBodyBytes > 0
+      ? options.maxBodyBytes
+      : DEFAULT_MAX_BODY_BYTES;
+  }
+  const envLimit = Number(process.env.ROUTER_MAX_BODY_BYTES);
+  // Number("") is 0, not NaN, so an env var set to an empty string (a blank
+  // .env line, or a shell export of an unset variable) must not pass this
+  // check - otherwise every request with a body gets capped at 0 bytes.
+  return Number.isFinite(envLimit) && envLimit > 0 ? envLimit : DEFAULT_MAX_BODY_BYTES;
+}
+
+function readBody(req: IncomingMessage, limit: number): Promise<Buffer> {
   return new Promise((resolve, reject) => {
     const chunks: Buffer[] = [];
-    req.on("data", (c) => chunks.push(c));
+    let total = 0;
+    req.on("data", (c: Buffer) => {
+      total += c.length;
+      if (total > limit) {
+        // Reject without destroying req: req and res share a socket, so
+        // destroying it here fires res's own "close" handler before this
+        // rejection reaches run.catch, which marks the request as aborted
+        // and skips the BodyTooLargeError branch entirely - the client got
+        // a connection reset instead of the 413 below. Dropping (not
+        // buffering) the remaining chunks still bounds memory; run.catch
+        // closes the connection once the 413 response has been sent.
+        reject(new BodyTooLargeError());
+        return;
+      }
+      chunks.push(c);
+    });
     req.on("end", () => resolve(Buffer.concat(chunks)));
     req.on("error", reject);
   });
@@ -111,9 +151,10 @@ export async function passThroughRequest(
   signal: AbortSignal
 ): Promise<void> {
   const upstream = options.upstream ?? "https://api.anthropic.com";
+  const maxBodyBytes = resolveMaxBodyBytes(options);
   const method = req.method ?? "GET";
   const hasBody = method !== "GET" && method !== "HEAD";
-  const bodyBuffer = hasBody ? await readBody(req) : undefined;
+  const bodyBuffer = hasBody ? await readBody(req, maxBodyBytes) : undefined;
   const body = bodyBuffer ? new Uint8Array(bodyBuffer) : undefined;
 
   const upstreamHeaders = new Headers();
@@ -158,8 +199,9 @@ export async function handleMessages(
     options.ledgerPath ?? process.env.ROUTER_LEDGER_PATH ?? "./router-ledger.jsonl";
   const pricing = options.pricing ?? DEFAULT_PRICING;
   const classify = options.classify ?? classifyTurn;
+  const maxBodyBytes = resolveMaxBodyBytes(options);
 
-  const bodyBuf = await readBody(req);
+  const bodyBuf = await readBody(req, maxBodyBytes);
   let body: any;
   try {
     body = JSON.parse(bodyBuf.toString("utf8"));
@@ -433,8 +475,26 @@ export async function handleMessages(
   }
 }
 
+// This proxy has no auth of its own, so the risk here is not stolen
+// Anthropic credentials - it is that any local process, including a page
+// in a browser the user already has open, can drive billed TypeSafe
+// classifier calls and grow the ledger through this machine. A simple
+// cross-origin POST needs no preflight, so the cheap defence is to
+// require JSON and refuse anything carrying browser provenance. No CLI
+// client sends either header.
+function rejectsAsBrowserRequest(req: IncomingMessage, res: ServerResponse): boolean {
+  const site = req.headers["sec-fetch-site"];
+  const looksLikeBrowser =
+    req.headers.origin !== undefined || (typeof site === "string" && site !== "none");
+  if (!looksLikeBrowser) return false;
+  res.writeHead(403, { "content-type": "application/json" });
+  res.end(JSON.stringify({ error: "browser_origin_rejected" }));
+  return true;
+}
+
 export function createProxyServer(options: ServerOptions = {}) {
   return createServer((req, res) => {
+    if (rejectsAsBrowserRequest(req, res)) return;
     // A client that hangs up mid-turn should not leave us paying for a
     // generation nobody will read. `writableFinished` distinguishes a
     // normal end-of-response close from a real disconnect.
@@ -444,6 +504,15 @@ export function createProxyServer(options: ServerOptions = {}) {
     });
 
     const routed = req.method === "POST" && requestPath(req.url) === "/v1/messages";
+    if (routed) {
+      const contentType = String(req.headers["content-type"] ?? "").toLowerCase();
+      if (!contentType.includes("application/json")) {
+        res.writeHead(415, { "content-type": "application/json" });
+        res.end(JSON.stringify({ error: "unsupported_media_type" }));
+        return;
+      }
+    }
+
     const run = routed
       ? handleMessages(req, res, options, abort.signal)
       : passThroughRequest(req, res, options, abort.signal);
@@ -452,6 +521,19 @@ export function createProxyServer(options: ServerOptions = {}) {
       // The client going away is not a proxy error - there is nobody left
       // to tell, and the socket is already gone.
       if (abort.signal.aborted) return;
+      // Expected oversized-body rejections don't log as errors.
+      if (err instanceof BodyTooLargeError) {
+        if (!res.headersSent) {
+          // The client may still be mid-upload - readBody stopped
+          // buffering but left the socket open, so refuse to keep it alive
+          // (the unread remainder would otherwise corrupt the next
+          // pipelined request) and drop it once the response is flushed.
+          res.writeHead(413, { "content-type": "application/json", connection: "close" });
+          res.end(JSON.stringify({ error: "request_too_large" }));
+          res.on("finish", () => req.destroy());
+        }
+        return;
+      }
       console.error("router error", err);
       if (!res.headersSent) {
         res.writeHead(502, { "content-type": "application/json" });

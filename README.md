@@ -91,6 +91,7 @@ ROUTER_MODE=live npm start
 | `ROUTER_MIN_TIER` | Cheapest tier the router can switch to | `haiku` |
 | `ROUTER_MAX_TIER` | Most expensive tier the router can switch to | `fable` |
 | `ROUTER_RESET_CONFIDENCE_FLOOR` | Minimum classifier confidence needed to switch on a reset | `0.5` |
+| `ROUTER_MAX_BODY_BYTES` | Hard cap on a buffered request body | `67108864` |
 | `ANTHROPIC_DEFAULT_HAIKU_MODEL` / `_SONNET_` / `_OPUS_` / `_FABLE_MODEL` | Which real model each tier maps to | see `src/pricing.ts` |
 
 When enabling live mode for the first time, it is recommended to set `ROUTER_MAX_TIER=opus` to limit routing to the cheaper tiers while you verify the router is working as expected.
@@ -99,7 +100,9 @@ When enabling live mode for the first time, it is recommended to set `ROUTER_MAX
 relies on whatever `ANTHROPIC_API_KEY` the client sends through), so
 binding to all interfaces would let anyone on the network trigger paid
 TypeSafe calls through your machine. Only widen it (e.g. `HOST=0.0.0.0`
-in a container) if you understand that tradeoff.
+in a container) if you understand that tradeoff. Additionally, requests
+carrying `Origin` or a cross-site `Sec-Fetch-Site` are refused, because a
+page in an already-open browser can otherwise reach loopback.
 
 Pricing (`src/pricing.ts`) reflects research done 2026-09-19 and **will
 drift** — check current Claude API pricing before trusting real spend
