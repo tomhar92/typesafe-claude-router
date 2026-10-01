@@ -56,10 +56,19 @@ function requestPath(url: string | undefined): string {
   }
 }
 
+const DEFAULT_MAX_BODY_BYTES = 67108864;
+
 function resolveMaxBodyBytes(options: ServerOptions): number {
-  if (options.maxBodyBytes !== undefined) return options.maxBodyBytes;
+  if (options.maxBodyBytes !== undefined) {
+    return Number.isFinite(options.maxBodyBytes) && options.maxBodyBytes > 0
+      ? options.maxBodyBytes
+      : DEFAULT_MAX_BODY_BYTES;
+  }
   const envLimit = Number(process.env.ROUTER_MAX_BODY_BYTES);
-  return Number.isFinite(envLimit) ? envLimit : 67108864;
+  // Number("") is 0, not NaN, so an env var set to an empty string (a blank
+  // .env line, or a shell export of an unset variable) must not pass this
+  // check - otherwise every request with a body gets capped at 0 bytes.
+  return Number.isFinite(envLimit) && envLimit > 0 ? envLimit : DEFAULT_MAX_BODY_BYTES;
 }
 
 function readBody(req: IncomingMessage, limit: number): Promise<Buffer> {
@@ -69,10 +78,13 @@ function readBody(req: IncomingMessage, limit: number): Promise<Buffer> {
     req.on("data", (c: Buffer) => {
       total += c.length;
       if (total > limit) {
-        // This proxy holds the whole request in memory in order to parse
-        // it, so an uncapped body is an unbounded allocation - loopback
-        // only narrows who can trigger it, it does not bound it.
-        req.destroy();
+        // Reject without destroying req: req and res share a socket, so
+        // destroying it here fires res's own "close" handler before this
+        // rejection reaches run.catch, which marks the request as aborted
+        // and skips the BodyTooLargeError branch entirely - the client got
+        // a connection reset instead of the 413 below. Dropping (not
+        // buffering) the remaining chunks still bounds memory; run.catch
+        // closes the connection once the 413 response has been sent.
         reject(new BodyTooLargeError());
         return;
       }
@@ -512,8 +524,13 @@ export function createProxyServer(options: ServerOptions = {}) {
       // Expected oversized-body rejections don't log as errors.
       if (err instanceof BodyTooLargeError) {
         if (!res.headersSent) {
-          res.writeHead(413, { "content-type": "application/json" });
+          // The client may still be mid-upload - readBody stopped
+          // buffering but left the socket open, so refuse to keep it alive
+          // (the unread remainder would otherwise corrupt the next
+          // pipelined request) and drop it once the response is flushed.
+          res.writeHead(413, { "content-type": "application/json", connection: "close" });
           res.end(JSON.stringify({ error: "request_too_large" }));
+          res.on("finish", () => req.destroy());
         }
         return;
       }

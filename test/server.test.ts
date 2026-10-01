@@ -1109,8 +1109,9 @@ test("rejects a body past the size cap instead of buffering it", async () => {
     method: "POST",
     headers: { "content-type": "application/json" },
     body: JSON.stringify({ model: "claude-sonnet-5", pad: "x".repeat(4096), messages: [] }),
-  }).catch(() => ({ status: 413 }) as { status: number });
+  });
   assert.equal(response.status, 413);
+  assert.deepEqual(await response.json(), { error: "request_too_large" });
 
   router.close();
 });
@@ -1126,10 +1127,46 @@ test("respects ROUTER_MAX_BODY_BYTES environment variable when no explicit optio
       method: "POST",
       headers: { "content-type": "application/json" },
       body: JSON.stringify({ model: "claude-sonnet-5", pad: "x".repeat(4096), messages: [] }),
-    }).catch(() => ({ status: 413 }) as { status: number });
+    });
     assert.equal(response.status, 413);
 
     router.close();
+  } finally {
+    if (savedEnv === undefined) {
+      delete process.env.ROUTER_MAX_BODY_BYTES;
+    } else {
+      process.env.ROUTER_MAX_BODY_BYTES = savedEnv;
+    }
+  }
+});
+
+test("treats an empty ROUTER_MAX_BODY_BYTES as unset instead of a 0-byte cap", async () => {
+  const savedEnv = process.env.ROUTER_MAX_BODY_BYTES;
+  try {
+    // Number("") is 0, not NaN - a blank env var must not silently cap
+    // every request body at 0 bytes.
+    process.env.ROUTER_MAX_BODY_BYTES = "";
+    const fake = createServer((_req, res) => {
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify({ content: [], usage: {} }));
+    });
+    const fakePort = await listen(fake);
+    const router = createProxyServer({
+      mode: "shadow",
+      upstream: `http://127.0.0.1:${fakePort}`,
+      classify: async () => null,
+    });
+    const port = await listen(router);
+
+    const response = await fetch(`http://127.0.0.1:${port}/v1/messages`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ model: "claude-sonnet-5", messages: [] }),
+    });
+    assert.notEqual(response.status, 413);
+
+    router.close();
+    fake.close();
   } finally {
     if (savedEnv === undefined) {
       delete process.env.ROUTER_MAX_BODY_BYTES;
