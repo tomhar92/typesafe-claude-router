@@ -86,6 +86,10 @@ ROUTER_MODE=live npm start
 | `ROUTER_LEDGER_PATH` | Where turn-by-turn cost data is logged | `./router-ledger.jsonl` |
 | `PORT` | Local proxy port | `8787` |
 | `HOST` | Interface the proxy binds to | `127.0.0.1` |
+| `ROUTER_CLASSIFIER` | Classifier transport: `typesafe` (SDK) or `openrouter` | `typesafe` |
+| `ROUTER_CLASSIFIER_MODEL` | Model name for the `openrouter` transport | `~typesafe/jev-latest` |
+| `OPENROUTER_API_KEY` | OpenRouter auth (required when `ROUTER_CLASSIFIER=openrouter`) | — |
+| `OPENROUTER_BASE_URL` | Override the OpenRouter API root | `https://openrouter.ai` |
 | `ROUTER_MARGIN_THRESHOLD` | Minimum probability margin before a downgrade/upgrade is even considered | `0.1` |
 | `ROUTER_STICKY_ASSUMPTION` | Max break-even turns for an automatic downgrade to be worth it | `3` |
 | `ROUTER_MIN_TIER` | Cheapest tier the router can switch to | `haiku` |
@@ -103,6 +107,25 @@ TypeSafe calls through your machine. Only widen it (e.g. `HOST=0.0.0.0`
 in a container) if you understand that tradeoff. Additionally, requests
 carrying `Origin` or a cross-site `Sec-Fetch-Site` are refused, because a
 page in an already-open browser can otherwise reach loopback.
+
+### Using OpenRouter for classification
+
+```bash
+ROUTER_CLASSIFIER=openrouter OPENROUTER_API_KEY=... \
+  typesafe-claude-router run -- claude
+```
+
+This sends the classifier question to OpenRouter's alpha Decisions
+endpoint (`POST /api/alpha/decisions`) instead of TypeSafe's own API. It
+is written against OpenRouter's published schema and unit-tested with a
+mocked `fetch`; it has **not** been exercised against the live endpoint,
+which is marked alpha and may change. The same payload bounds and
+"what leaves your machine" caveats apply, with OpenRouter and its
+provider in the path.
+
+Whatever the transport, the router validates every answer: an unknown tier
+name, a missing confidence, or fewer than four tier probabilities is
+treated as no answer (logged as `classifier-unavailable`).
 
 Pricing (`src/pricing.ts`) reflects research done 2026-09-19 and **will
 drift** — check current Claude API pricing before trusting real spend
