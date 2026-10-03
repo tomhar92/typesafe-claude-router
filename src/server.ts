@@ -549,7 +549,62 @@ export function createProxyServer(options: ServerOptions = {}) {
   });
 }
 
+const HOSTED_BACKEND_HOST = "api.typesafe.ai";
+
+/**
+ * Configuration problems worth telling the operator about before the
+ * first turn rather than one warning line per turn forever. A missing
+ * TYPESAFE_API_KEY currently surfaces only as the TypeSafeClient
+ * constructor throwing inside classifyTurn's catch, which degrades into
+ * `classifier-unavailable` on every turn and looks like a flaky API.
+ */
+export function validateStartupConfig(env: NodeJS.ProcessEnv): string[] {
+  const problems: string[] = [];
+  const baseURL = env.TYPESAFE_BASE_URL?.trim();
+  let keyRequired = true;
+  if (baseURL) {
+    try {
+      // Only TypeSafe's hosted API is known to need a key. A self-hosted
+      // /v1/systemone server (OpenJev, Ollaya, ...) frequently has none,
+      // and insisting on a dummy value would just be friction.
+      keyRequired = new URL(baseURL).hostname === HOSTED_BACKEND_HOST;
+    } catch {
+      problems.push(`TYPESAFE_BASE_URL is not a valid URL: ${baseURL}`);
+    }
+  }
+  if (keyRequired && !env.TYPESAFE_API_KEY?.trim()) {
+    problems.push(
+      "TYPESAFE_API_KEY is not set: every turn would log classifier-unavailable and the router would never route."
+    );
+  }
+  if (env.ROUTER_MODE === "live" && !env.ROUTER_MAX_TIER?.trim()) {
+    problems.push(
+      "ROUTER_MODE=live with no ROUTER_MAX_TIER: nothing caps autonomous spend. Set ROUTER_MAX_TIER=opus unless you mean to allow fable."
+    );
+  }
+  return problems;
+}
+
+/** Where the classifier is sent, mirroring the SDK's own defaults, so the
+ * operator can see at startup whether turns are going to a hosted API or a
+ * local model. */
+export function describeBackend(env: NodeJS.ProcessEnv): string {
+  const baseURL = (env.TYPESAFE_BASE_URL?.trim() || `https://${HOSTED_BACKEND_HOST}`).replace(/\/+$/, "");
+  return `${baseURL} (model ${env.TYPESAFE_DEFAULT_MODEL?.trim() || "jev-latest"})`;
+}
+
+/** Prints every startup problem and returns whether startup must abort.
+ * A missing key or an unparseable base URL is fatal: a router that can
+ * never classify is useless, whereas a missing spend ceiling is the
+ * operator's call. */
+export function reportStartupProblems(env: NodeJS.ProcessEnv): boolean {
+  const problems = validateStartupConfig(env);
+  for (const problem of problems) console.warn(`warning: ${problem}`);
+  return problems.some((p) => p.startsWith("TYPESAFE_API_KEY") || p.startsWith("TYPESAFE_BASE_URL"));
+}
+
 if (isMainModule(import.meta.url)) {
+  if (reportStartupProblems(process.env)) process.exit(1);
   const port = Number(process.env.PORT ?? 8787);
   // Default to loopback-only: this proxy holds no auth of its own (it
   // relies on whatever ANTHROPIC_API_KEY the client already sends
@@ -561,5 +616,6 @@ if (isMainModule(import.meta.url)) {
   createProxyServer().listen(port, host, () => {
     const mode = process.env.ROUTER_MODE === "live" ? "live" : "shadow";
     console.log(`typesafe-claude-router listening on http://${host}:${port} (mode=${mode})`);
+    console.log(`classifier: ${describeBackend(process.env)}`);
   });
 }
