@@ -1,32 +1,64 @@
+import { createHash } from "node:crypto";
+import { stringifyWithoutCacheControl } from "./normalize.js";
 import type { ConversationState, Tier } from "./types.js";
 
-const store = new WeakMap<object, ConversationState>();
+// Socket identity is not conversation identity. Connection pools rotate,
+// Claude Code issues background small-model calls over the same pooled
+// socket, and two concurrent sessions can share one - each of which
+// resets turnsOnCurrentTier and trips detectReset against a history
+// belonging to something else. The system prompt plus the first message
+// is stable for the life of a session, distinguishes concurrent
+// sessions, and hands background calls their own state for free.
+//
+// A /compact rewrites the history, so it produces a new key. That is the
+// behaviour we want: the cache is being rebuilt regardless, and the new
+// state's empty history makes the next turn a reset window - which is
+// exactly what a compact is.
+export function conversationKeyFor(body: { system?: unknown; messages?: unknown }): string {
+  const messages = Array.isArray(body.messages) ? body.messages : [];
+  const seed = stringifyWithoutCacheControl([body.system ?? null, messages[0] ?? null]);
+  return `conv-${createHash("sha256").update(seed).digest("hex").slice(0, 16)}`;
+}
 
-// Ledger lines need a conversationKey that actually distinguishes
-// concurrent sessions - the previous hardcoded "socket" string logged the
-// same literal for every connection, making it useless for telling
-// interleaved sessions apart in the report. This is process-local and
-// resets on restart, which is fine: it only needs to be unique among the
-// connections a single running proxy instance is currently juggling.
-let nextConnectionId = 0;
+// The WeakMap this replaces was collected with its socket. A string-keyed
+// Map is not, so state has to be aged out explicitly or a long-lived
+// proxy accumulates one entry per session it has ever seen.
+const MAX_IDLE_MS = 6 * 60 * 60 * 1000;
+const states = new Map<string, { state: ConversationState; lastSeen: number }>();
 
-export function getOrInitState(socket: object, initialTier: Tier): ConversationState {
-  let state = store.get(socket);
-  if (!state) {
-    nextConnectionId += 1;
-    state = {
-      connectionId: `conn-${nextConnectionId}`,
-      currentTier: initialTier,
-      turnsOnCurrentTier: 0,
-      lastPrefixTokens: 0,
-      lastNewTokens: 0,
-      lastOutputTokens: 0,
-      lastMessages: [],
-      lastRequestedTier: initialTier,
-    };
-    store.set(socket, state);
+export function getOrInitState(
+  key: string,
+  initialTier: Tier,
+  now: number = Date.now()
+): ConversationState {
+  for (const [existing, entry] of states) {
+    if (now - entry.lastSeen > MAX_IDLE_MS) states.delete(existing);
   }
+  const found = states.get(key);
+  if (found) {
+    found.lastSeen = now;
+    return found.state;
+  }
+  const state: ConversationState = {
+    conversationId: key,
+    currentTier: initialTier,
+    turnsOnCurrentTier: 0,
+    lastPrefixTokens: 0,
+    lastNewTokens: 0,
+    lastOutputTokens: 0,
+    lastMessages: [],
+    lastRequestedTier: initialTier,
+  };
+  states.set(key, { state, lastSeen: now });
   return state;
+}
+
+/** Drops every tracked conversation. State is process-global and keyed by
+ * content, so tests that reuse the same first message would otherwise
+ * inherit each other's routing history; socket keying used to isolate them
+ * by accident. */
+export function resetConversationStates(): void {
+  states.clear();
 }
 
 export function updateState(

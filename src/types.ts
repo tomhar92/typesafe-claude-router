@@ -21,9 +21,10 @@ export interface ClassifyResult {
 }
 
 export interface ConversationState {
-  /** Stable per-socket id for this conversation, used as the ledger's
-   * `conversationKey` so turns from concurrent sessions can be told apart. */
-  connectionId: string;
+  /** Stable per-conversation id derived from the system prompt and first
+   * message, used as the ledger's `conversationKey` so turns from
+   * concurrent sessions can be told apart. */
+  conversationId: string;
   currentTier: Tier;
   turnsOnCurrentTier: number;
   lastPrefixTokens: number;

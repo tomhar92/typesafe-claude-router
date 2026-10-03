@@ -93,7 +93,7 @@ test("envNumber: falls back on Infinity/-Infinity instead of a threshold no marg
 
 function state(overrides: Partial<ConversationState> = {}): ConversationState {
   return {
-    connectionId: "conn-1",
+    conversationId: "conn-1",
     currentTier: "sonnet",
     turnsOnCurrentTier: 5,
     lastPrefixTokens: 20_000,

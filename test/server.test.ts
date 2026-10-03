@@ -6,6 +6,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { gzipSync } from "node:zlib";
 import { createProxyServer } from "../src/server.js";
+import { resetConversationStates } from "../src/conversationKey.js";
 import { readLedger } from "../src/ledger.js";
 import { DEFAULT_PRICING } from "../src/pricing.js";
 import { execFileSync } from "node:child_process";
@@ -16,6 +17,9 @@ const ledgerMarginsFixture = fileURLToPath(
 );
 
 function listen(server: import("node:http").Server): Promise<number> {
+  // Routing state is keyed by conversation content, not by socket, so
+  // tests that reuse a first message must not inherit each other's state.
+  resetConversationStates();
   return new Promise((resolve) => {
     server.listen(0, () => {
       const address = server.address();
@@ -24,11 +28,10 @@ function listen(server: import("node:http").Server): Promise<number> {
   });
 }
 
-// `fetch` doesn't guarantee socket reuse across sequential calls even with
-// keep-alive, but a real `claude` process holds one persistent connection
-// to the proxy for the session's duration (that's how conversation state
-// is keyed - see conversationKey.ts). A single-socket keep-alive Agent
-// reproduces that so multi-turn behavior can actually be tested.
+// A single-socket keep-alive Agent reproduces a real `claude` process
+// holding one persistent connection, so the keep-alive path gets exercised.
+// Conversation state is no longer keyed on the socket (see
+// conversationKey.ts), so this is not needed for state continuity.
 function postOnSharedSocket(agent: Agent, port: number, body: unknown): Promise<{ status: number }> {
   return new Promise((resolve, reject) => {
     const payload = JSON.stringify(body);
@@ -284,6 +287,54 @@ test("a downgrade stays sticky on the next turn even though Claude Code keeps re
   assert.equal(lines[1].actualTier, "haiku");
 
   agent.destroy();
+  router.close();
+  fake.close();
+});
+
+test("routing state follows the conversation across separate connections", async () => {
+  const fake = await withFakeUpstream(() => ({
+    status: 200,
+    usage: {
+      input_tokens: 100,
+      output_tokens: 50,
+      cache_creation_input_tokens: 100,
+      cache_read_input_tokens: 0,
+    },
+    text: "ok",
+  }));
+  const ledgerPath = join(mkdtempSync(join(tmpdir(), "ledger-")), "ledger.jsonl");
+  const router = createProxyServer({
+    upstream: fake.url,
+    mode: "shadow",
+    ledgerPath,
+    classify: async () => ({
+      choice: "sonnet",
+      confidence: 0.9,
+      probabilities: { haiku: 0.05, sonnet: 0.9, opus: 0.03, fable: 0.02 },
+    }),
+  });
+  const port = await listen(router);
+
+  const first = [{ role: "user", content: "start the task" }];
+  const second = [...first, { role: "assistant", content: "ok" }, { role: "user", content: "next" }];
+  // A brand-new, non-keep-alive Agent per request guarantees each turn
+  // arrives on its own TCP connection - the case socket keying lost.
+  for (const messages of [first, second]) {
+    const agent = new Agent({ keepAlive: false });
+    await postOnSharedSocket(agent, port, {
+      model: DEFAULT_PRICING.modelAlias.sonnet,
+      system: "You are Claude Code.",
+      messages,
+    });
+    agent.destroy();
+  }
+
+  const lines = readLedger(ledgerPath);
+  assert.equal(lines.length, 2);
+  assert.equal(lines[1].turnsOnCurrentTier, 2);
+  assert.equal(lines[0].conversationKey, lines[1].conversationKey);
+  assert.equal(lines[1].resetDetected, false);
+
   router.close();
   fake.close();
 });

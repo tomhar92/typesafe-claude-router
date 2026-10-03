@@ -178,11 +178,10 @@ numbers from the report.
 
 ## Known limitations (v1)
 
-- Conversation identity is keyed by the TCP connection Claude Code holds
-  open, not a stable session ID (Anthropic's API doesn't send one). If
-  Claude Code's HTTP client doesn't keep that connection alive across
-  turns, routing state won't persist between turns — verify this in your
-  own environment before relying on the sticky/break-even logic.
+- Conversations are identified by a hash of the system prompt and first
+  message, so `/compact` starts a new conversation record, which is
+  intentional (the cache is rebuilt then anyway). State is held in memory
+  and dropped after six idle hours or on restart.
 - The upgrade-suggestion note is injected as conversation content for the
   model to relay, not a UI element — it depends on the model choosing to
   mention it. It's only injected in `live` mode, to keep `shadow` mode's

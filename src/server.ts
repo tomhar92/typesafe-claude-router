@@ -1,5 +1,5 @@
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
-import { getOrInitState, updateState } from "./conversationKey.js";
+import { conversationKeyFor, getOrInitState, updateState } from "./conversationKey.js";
 import { decide, DEFAULT_LIMITS } from "./policy.js";
 import { computeMargins } from "./margins.js";
 import { classifyTurn, type ClassifyInput, type ClassifyOptions } from "./classify.js";
@@ -232,13 +232,13 @@ export async function handleMessages(
   // report can surface how often this happens. A run full of
   // `unknown-model` lines means the alias table needs a new entry.
   if (requestedTier === null) {
-    const state = getOrInitState(req.socket, "sonnet");
+    const state = getOrInitState(conversationKeyFor(body), "sonnet");
     const { response, usage } = await forwardAndStream(req, res, body, upstream, signal);
     if (response.ok) {
       // The turn still happened and still grew the conversation, even
       // though we couldn't price or route it - lastMessages must move
       // forward so the *next* turn's detectReset() compares against this
-      // turn's messages instead of the socket's initial `[]`. Leaving it
+      // turn's messages instead of the conversation's initial `[]`. Leaving it
       // stale made any turn right after an unknown-model turn look like a
       // reset, which bypasses decide()'s margin/sticky/break-even
       // safeguards. decisionTier is state.currentTier (unchanged) because
@@ -259,8 +259,8 @@ export async function handleMessages(
       appendLedgerLine(ledgerPath, {
         v: 2,
         ts: new Date().toISOString(),
-        conversationKey: state.connectionId,
-        probabilities: {} as Record<Tier, number>,
+        conversationKey: state.conversationId,
+        probabilities:{} as Record<Tier, number>,
         confidence: null,
         downgradeMargin: 0,
         upgradeMargin: 0,
@@ -286,7 +286,7 @@ export async function handleMessages(
   // everything past this guard can treat the request's model as a plain
   // string rather than the `unknown` it started as.
   const requestedModelString = requestedModel as string;
-  const state = getOrInitState(req.socket, requestedTier);
+  const state = getOrInitState(conversationKeyFor(body), requestedTier);
 
   // Claude Code re-sends whatever tier it thinks the session is on. If that
   // no longer matches what we tracked last turn, the user changed it
@@ -455,7 +455,7 @@ export async function handleMessages(
     appendLedgerLine(ledgerPath, {
       v: 2,
       ts: new Date().toISOString(),
-      conversationKey: state.connectionId,
+      conversationKey: state.conversationId,
       probabilities: classification?.probabilities ?? ({} as Record<Tier, number>),
       confidence: classification?.confidence ?? null,
       downgradeMargin: marginInfo?.downgradeMargin ?? 0,
