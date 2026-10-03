@@ -32,8 +32,9 @@ Full design rationale: `docs/superpowers/specs/2026-09-19-typesafe-router-design
 ## What leaves your machine
 
 Every turn, the last 6 messages of the conversation (including tool
-results and file contents read into the session) are sent to TypeSafe's
-API for classification, in addition to the normal Anthropic API traffic.
+results and file contents read into the session) are sent to the
+classifier backend (TypeSafe's hosted API by default; see "Classifier
+backends" below), in addition to the normal Anthropic API traffic.
 The payload is bounded: image blocks are omitted, each string is truncated
 at 2,000 characters, and the whole payload is capped at roughly 24,000
 characters. The caps reduce the exposure, they do not eliminate it - if
@@ -43,45 +44,112 @@ that's not acceptable for a given session or codebase, don't point
 All non-`/v1/messages` traffic (such as `/v1/messages/count_tokens` for
 context accounting) is forwarded unmodified and unlogged to Anthropic.
 
+## Classifier backends
+
+The classifier talks to TypeSafe's `/v1/systemone` API through the
+official SDK, which reads two environment variables, so any server that
+implements the same wire format works without code changes:
+
+```bash
+TYPESAFE_BASE_URL=http://localhost:8000 \
+TYPESAFE_DEFAULT_MODEL=<model name the server expects> \
+typesafe-claude-router run -- claude
+```
+
+`TYPESAFE_API_KEY` is only required for TypeSafe's hosted API; the router
+checks this at startup and prints which endpoint and model it is using.
+Open and third-party decision models that advertise a TypeSafe-compatible
+`/v1/systemone` endpoint (for example OpenJev, or models served by Ollaya)
+are candidates, but **this repo has not tested any of them**.
+
+Things to check before trusting a different backend:
+
+- **Calibration.** The margin thresholds were chosen for Jev's probability
+  distributions. A smaller model may be overconfident or flat. Run it in
+  shadow mode first and read the report.
+- **All four tiers come back.** An answer missing any tier's probability
+  is treated as no answer (logged as `classifier-unavailable`).
+- **Where the payload goes.** The "What leaves your machine" caveats apply
+  to hosted backends; a model on `localhost` keeps the payload on your
+  machine.
+
+Hosted services that use a different request format (for example
+OpenRouter's `/api/alpha/decisions`) are not supported yet and would need
+an adapter.
+
 ## Setup
 
 Requires Node 20+ (the TypeSafe SDK requires it; the proxy itself uses the global `fetch`/`Headers` APIs).
 
 ```bash
-npm install
 export TYPESAFE_API_KEY=...      # from typesafe.ai
-export ANTHROPIC_API_KEY=...     # your normal Anthropic key/subscription auth
-npm start                        # starts the proxy on 127.0.0.1:8787 in shadow mode
+npx typesafe-claude-router run -- claude
 ```
 
-In another terminal, point Claude Code at it:
+`run` starts the proxy on an ephemeral loopback port in shadow mode,
+launches the command after `--` with `ANTHROPIC_BASE_URL` pointed at it,
+and shuts the proxy down when the command exits. Your normal Anthropic
+auth is passed through untouched. The router refuses to start without
+`TYPESAFE_API_KEY` rather than quietly logging `classifier-unavailable`
+on every turn.
+
+The package is not published to npm yet. From a clone, run `npm install &&
+npm run build && npm link`, which puts the same `typesafe-claude-router`
+command on your PATH.
+
+### Keeping the proxy running
+
+If you want one long-lived proxy for several sessions, use two terminals:
+
+```bash
+typesafe-claude-router serve     # 127.0.0.1:8787, shadow mode (PORT/HOST to change)
+```
 
 ```bash
 export ANTHROPIC_BASE_URL=http://localhost:8787
 claude
 ```
 
+From a clone without `npm link`, `npm start` is the same as `serve`.
+
+### Reading the results
+
 Shadow mode (the default) never changes which model actually serves a
 turn — it only logs what it *would* have done. Watch `./router-ledger.jsonl`
 fill in during a real session, then run:
 
 ```bash
-npm run report -- ./router-ledger.jsonl
+typesafe-claude-router report            # or: report path/to/ledger.jsonl
 ```
 
-to see judged decisions and the real cost delta vs. never routing at all.
+The path defaults to `ROUTER_LEDGER_PATH`, then `./router-ledger.jsonl`.
+(From a clone: `npm run report`.)
 
-When you're ready to let it actually switch models:
+### Before enabling live mode
+
+Check, from a few real shadow-mode sessions, that:
+
+- the report shows no (or very few) `classifier-unavailable` turns;
+- there are no `unknown-model` turns, or you have added those models to
+  `modelAlias` in `src/pricing.ts`;
+- the decisions the router *would* have made look sensible for the work you
+  were actually doing.
+
+Then let it switch models, with a spend ceiling:
 
 ```bash
-ROUTER_MODE=live npm start
+ROUTER_MODE=live ROUTER_MAX_TIER=opus typesafe-claude-router run -- claude
 ```
+
+The router warns at startup if live mode has no `ROUTER_MAX_TIER`.
 
 ## Configuration
 
 | Env var | Purpose | Default |
 | --- | --- | --- |
-| `TYPESAFE_API_KEY` | TypeSafe auth (required) | — |
+| `TYPESAFE_API_KEY` | TypeSafe auth (required for the hosted API, optional for a self-hosted `TYPESAFE_BASE_URL`) | — |
+| `TYPESAFE_BASE_URL` | Classifier API root; any `/v1/systemone`-compatible server | `https://api.typesafe.ai` |
+| `TYPESAFE_DEFAULT_MODEL` | Classifier model name sent to that server | `jev-latest` |
 | `ROUTER_MODE` | `shadow` or `live` | `shadow` |
 | `ROUTER_LEDGER_PATH` | Where turn-by-turn cost data is logged | `./router-ledger.jsonl` |
 | `PORT` | Local proxy port | `8787` |
@@ -98,7 +166,7 @@ ROUTER_MODE=live npm start
 | `ROUTER_MAX_BODY_BYTES` | Hard cap on a buffered request body | `67108864` |
 | `ANTHROPIC_DEFAULT_HAIKU_MODEL` / `_SONNET_` / `_OPUS_` / `_FABLE_MODEL` | Which real model each tier maps to | see `src/pricing.ts` |
 
-When enabling live mode for the first time, it is recommended to set `ROUTER_MAX_TIER=opus` to limit routing to the cheaper tiers while you verify the router is working as expected.
+When enabling live mode for the first time, set `ROUTER_MAX_TIER=opus` to limit routing to the cheaper tiers while you verify the router is working as expected.
 
 `HOST` defaults to loopback-only: the proxy has no auth of its own (it
 relies on whatever `ANTHROPIC_API_KEY` the client sends through), so

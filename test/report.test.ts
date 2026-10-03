@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { summarize } from "../bin/report.js";
+import { summarize, resolveLedgerPath } from "../bin/report.js";
 import type { LedgerLine } from "../src/ledger.js";
 
 function line(overrides: Partial<LedgerLine>): LedgerLine {
@@ -78,4 +78,11 @@ test("summarize counts unknown-model turns and treats their unpriced cost as zer
   assert.ok(Math.abs(summary.totalActualUsd - 0.01) < 1e-9);
   assert.ok(Math.abs(summary.totalCounterfactualUsd - 0.01) < 1e-9);
   assert.ok(Math.abs(summary.deltaUsd) < 1e-9);
+});
+
+test("resolveLedgerPath: argument, then env, then default; --help yields null", () => {
+  assert.equal(resolveLedgerPath(["a.jsonl"], { ROUTER_LEDGER_PATH: "b.jsonl" }), "a.jsonl");
+  assert.equal(resolveLedgerPath([], { ROUTER_LEDGER_PATH: "b.jsonl" }), "b.jsonl");
+  assert.equal(resolveLedgerPath([], {}), "./router-ledger.jsonl");
+  assert.equal(resolveLedgerPath(["--help"], {}), null);
 });
