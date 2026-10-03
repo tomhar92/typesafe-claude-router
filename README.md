@@ -46,36 +46,52 @@ context accounting) is forwarded unmodified and unlogged to Anthropic.
 
 ## Classifier backends
 
-The classifier talks to TypeSafe's `/v1/systemone` API through the
-official SDK, which reads two environment variables, so any server that
-implements the same wire format works without code changes:
+Two transports are built in, chosen with `ROUTER_CLASSIFIER`:
 
-```bash
-TYPESAFE_BASE_URL=http://localhost:8000 \
-TYPESAFE_DEFAULT_MODEL=<model name the server expects> \
-typesafe-claude-router run -- claude
-```
+- **`typesafe`** (default): TypeSafe's `/v1/systemone` API through the
+  official SDK. The SDK reads `TYPESAFE_BASE_URL` and
+  `TYPESAFE_DEFAULT_MODEL`, so any server that implements the same wire
+  format works without code changes:
 
-`TYPESAFE_API_KEY` is only required for TypeSafe's hosted API; the router
-checks this at startup and prints which endpoint and model it is using.
-Open and third-party decision models that advertise a TypeSafe-compatible
-`/v1/systemone` endpoint (for example OpenJev, or models served by Ollaya)
-are candidates, but **this repo has not tested any of them**.
+  ```bash
+  TYPESAFE_BASE_URL=http://localhost:8000 \
+  TYPESAFE_DEFAULT_MODEL=<model name the server expects> \
+  typesafe-claude-router run -- claude
+  ```
+
+  `TYPESAFE_API_KEY` is only required for TypeSafe's hosted API.
+- **`openrouter`**: OpenRouter's alpha Decisions endpoint
+  (`POST /api/alpha/decisions`):
+
+  ```bash
+  ROUTER_CLASSIFIER=openrouter OPENROUTER_API_KEY=... \
+    typesafe-claude-router run -- claude
+  ```
+
+  This is written against OpenRouter's published schema and unit-tested
+  with a mocked `fetch`; it has **not** been exercised against the live
+  endpoint, which is marked alpha and may change. `ROUTER_CLASSIFIER_MODEL`
+  picks the model (default `~typesafe/jev-latest`).
+
+The router checks the backend settings at startup and prints which
+endpoint and model it is using. Open and third-party decision models that
+advertise a TypeSafe-compatible `/v1/systemone` endpoint (for example
+OpenJev, or models served by Ollaya) are candidates, but **this repo has
+not tested any of them**. Other hosted formats need an adapter; the
+`ClassifierBackend` interface in `src/classifierBackend.ts` is the seam.
 
 Things to check before trusting a different backend:
 
 - **Calibration.** The margin thresholds were chosen for Jev's probability
   distributions. A smaller model may be overconfident or flat. Run it in
   shadow mode first and read the report.
-- **All four tiers come back.** An answer missing any tier's probability
-  is treated as no answer (logged as `classifier-unavailable`).
-- **Where the payload goes.** The "What leaves your machine" caveats apply
-  to hosted backends; a model on `localhost` keeps the payload on your
+- **Every answer is validated.** An unknown tier name, a missing
+  confidence, or fewer than four tier probabilities is treated as no
+  answer (logged as `classifier-unavailable`), whatever the transport.
+- **Where the payload goes.** The "What leaves your machine" caveats and
+  payload bounds apply to every hosted backend (with OpenRouter and its
+  provider in the path); a model on `localhost` keeps the payload on your
   machine.
-
-Hosted services that use a different request format (for example
-OpenRouter's `/api/alpha/decisions`) are not supported yet and would need
-an adapter.
 
 ## Setup
 
@@ -154,6 +170,10 @@ The router warns at startup if live mode has no `ROUTER_MAX_TIER`.
 | `ROUTER_LEDGER_PATH` | Where turn-by-turn cost data is logged | `./router-ledger.jsonl` |
 | `PORT` | Local proxy port | `8787` |
 | `HOST` | Interface the proxy binds to | `127.0.0.1` |
+| `ROUTER_CLASSIFIER` | Classifier transport: `typesafe` (SDK) or `openrouter` | `typesafe` |
+| `ROUTER_CLASSIFIER_MODEL` | Model name for the `openrouter` transport | `~typesafe/jev-latest` |
+| `OPENROUTER_API_KEY` | OpenRouter auth (required when `ROUTER_CLASSIFIER=openrouter`) | — |
+| `OPENROUTER_BASE_URL` | Override the OpenRouter API root | `https://openrouter.ai` |
 | `ROUTER_MARGIN_THRESHOLD` | Minimum probability margin before a downgrade/upgrade is even considered | `0.1` |
 | `ROUTER_STICKY_ASSUMPTION` | Max break-even turns for an automatic downgrade to be worth it | `3` |
 | `ROUTER_MIN_TIER` | Cheapest tier the router can switch to | `haiku` |

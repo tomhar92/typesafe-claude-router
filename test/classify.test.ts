@@ -1,6 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { classifyTurn } from "../src/classify.js";
+import { sdkBackend } from "../src/classifierBackend.js";
 
 const PROBABILITIES = { haiku: 0.1, sonnet: 0.1, opus: 0.7, fable: 0.1 };
 
@@ -12,19 +13,19 @@ function fakeResponse(choiceValue: string, probabilities: Record<string, number>
   };
 }
 
-function clientReturning(response: unknown, onCall?: (request: unknown, options: unknown) => void) {
-  return {
+function backendReturning(response: unknown, onCall?: (request: unknown, options: unknown) => void) {
+  return sdkBackend({
     systemOne: (async (request: unknown, options: unknown) => {
       onCall?.(request, options);
       return response;
     }) as never,
-  };
+  });
 }
 
 test("maps a successful TypeSafe response to a ClassifyResult", async () => {
   const result = await classifyTurn(
     { recentMessages: [], latestUserMessage: "fix this hard bug" },
-    { client: clientReturning(fakeResponse("opus")) }
+    { backend: backendReturning(fakeResponse("opus")) }
   );
   assert.deepEqual(result, { choice: "opus", confidence: 0.8, probabilities: PROBABILITIES });
 });
@@ -33,11 +34,11 @@ test("returns null when the call rejects", async () => {
   const result = await classifyTurn(
     { recentMessages: [], latestUserMessage: "x" },
     {
-      client: {
+      backend: sdkBackend({
         systemOne: (async () => {
           throw new Error("network error");
         }) as never,
-      },
+      }),
     }
   );
   assert.equal(result, null);
@@ -49,7 +50,7 @@ test("gives the SDK the deadline and disables its retries", async () => {
     { recentMessages: [], latestUserMessage: "hi" },
     {
       timeoutMs: 1500,
-      client: clientReturning(fakeResponse("sonnet"), (_request, options) => {
+      backend: backendReturning(fakeResponse("sonnet"), (_request, options) => {
         seen = options;
       }),
     }
@@ -66,7 +67,7 @@ test("forwards the caller's abort signal to the SDK", async () => {
     { recentMessages: [], latestUserMessage: "hi" },
     {
       signal: controller.signal,
-      client: clientReturning(fakeResponse("sonnet"), (_request, options) => {
+      backend: backendReturning(fakeResponse("sonnet"), (_request, options) => {
         seen = options;
       }),
     }
@@ -77,7 +78,15 @@ test("forwards the caller's abort signal to the SDK", async () => {
 test("treats a partial probability set as an unusable answer", async () => {
   const result = await classifyTurn(
     { recentMessages: [], latestUserMessage: "hi" },
-    { client: clientReturning(fakeResponse("sonnet", { sonnet: 0.8 })) }
+    { backend: backendReturning(fakeResponse("sonnet", { sonnet: 0.8 })) }
+  );
+  assert.equal(result, null);
+});
+
+test("treats a tier name outside the known set as an unusable answer", async () => {
+  const result = await classifyTurn(
+    { recentMessages: [], latestUserMessage: "hi" },
+    { backend: backendReturning(fakeResponse("gpt-9")) }
   );
   assert.equal(result, null);
 });

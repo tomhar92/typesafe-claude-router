@@ -1,18 +1,9 @@
-import { choice, TypeSafeClient, type JsonValue } from "@typesafe-ai/sdk";
+import type { JsonValue } from "@typesafe-ai/sdk";
+import { backendFromEnv, type ClassifierBackend } from "./classifierBackend.js";
 import { TIER_ORDER, type ClassifyResult, type Tier } from "./types.js";
 
-let client: TypeSafeClient | undefined;
-
-function getClient(): TypeSafeClient {
-  if (!client) client = new TypeSafeClient();
-  return client;
-}
-
 // `satisfies Record<Tier, string>` makes a missing or misspelled tier key
-// a compile error; `as const` keeps the literal key types, so
-// `answers.tier.choice` comes back as Tier and the old `as Tier` cast -
-// which would have happily passed through any string the API returned -
-// is gone.
+// a compile error.
 const TIER_CRITERIA = {
   haiku:
     "Mechanical or trivial: reading a file, running a known command, a simple factual question, a small well-specified edit.",
@@ -24,6 +15,9 @@ const TIER_CRITERIA = {
     "Exceptionally demanding: the task explicitly calls for the deepest available reasoning or highest-stakes correctness.",
 } as const satisfies Record<Tier, string>;
 
+const TIER_QUESTION =
+  "Which model tier does this turn actually need, given the recent conversation and the latest user message?";
+
 export interface ClassifyInput {
   recentMessages: JsonValue[];
   latestUserMessage: string;
@@ -32,51 +26,61 @@ export interface ClassifyInput {
 export interface ClassifyOptions {
   timeoutMs?: number;
   signal?: AbortSignal;
-  /** Injection point for tests; defaults to the shared client. */
-  client?: Pick<TypeSafeClient, "systemOne">;
+  /** Overrides the backend chosen by ROUTER_CLASSIFIER; used by tests. */
+  backend?: ClassifierBackend;
 }
 
-function hasEveryTier(probabilities: Record<string, number>): boolean {
-  return TIER_ORDER.every((tier) => Number.isFinite(probabilities[tier]));
+let defaultBackend: ClassifierBackend | undefined;
+
+function isTier(value: string): value is Tier {
+  return (TIER_ORDER as readonly string[]).includes(value);
+}
+
+function hasEveryTier(probabilities: Record<string, number> | undefined): probabilities is Record<Tier, number> {
+  return (
+    probabilities !== undefined && TIER_ORDER.every((tier) => Number.isFinite(probabilities[tier]))
+  );
 }
 
 export async function classifyTurn(
   input: ClassifyInput,
   options: ClassifyOptions = {}
 ): Promise<ClassifyResult | null> {
-  const { timeoutMs = 2000, signal, client: injected } = options;
+  const { timeoutMs = 2000, signal } = options;
   try {
-    const { answers } = await (injected ?? getClient()).systemOne(
+    // Built inside the try on purpose: a misconfigured backend must
+    // degrade to "classifier unavailable" like any other transport failure.
+    const backend = options.backend ?? (defaultBackend ??= backendFromEnv(process.env));
+    const answer = await backend.choose(
       {
         state: {
           recentMessages: input.recentMessages,
           latestUserMessage: input.latestUserMessage,
         },
-        questions: {
-          tier: choice(
-            "Which model tier does this turn actually need, given the recent conversation and the latest user message?",
-            TIER_CRITERIA
-          ),
-        },
+        instructions: TIER_QUESTION,
+        criteria: TIER_CRITERIA,
       },
-      // The SDK owns the deadline. The hand-rolled wrapper this replaces
-      // only rejected our own promise - it cancelled nothing, so the SDK
-      // went on retrying (2 retries, 10s per attempt, with backoff) for
-      // up to ~30s per turn, billed, with the answer thrown away. A
-      // routing decision is useful for exactly one turn, so a retry that
-      // lands after it is pure cost: no retries, one short deadline.
-      { timeout: timeoutMs, retry: { maxRetries: 0 }, signal }
+      { timeoutMs, signal }
     );
-    const answer = answers.tier;
-    // A partial probability set would make every margin NaN, every
-    // comparison false, and the router hold forever while the ledger
-    // reported ordinary policy operation. Treat it as no answer at all,
-    // which the server already logs distinctly.
-    if (!hasEveryTier(answer.probabilities)) return null;
+    // Backends are untrusted translators. A tier name we do not know, or a
+    // missing confidence, would flow straight into the policy. A partial
+    // probability set would make every margin NaN, every comparison
+    // false, and the router hold forever while the ledger reported
+    // ordinary policy operation. All of these count as no answer, which
+    // the server already logs distinctly.
+    if (!isTier(answer.choice)) return null;
+    const { probabilities, confidence } = answer;
+    if (!hasEveryTier(probabilities)) return null;
+    if (confidence === undefined || !Number.isFinite(confidence)) return null;
     return {
       choice: answer.choice,
-      confidence: answer.confidence,
-      probabilities: { ...answer.probabilities },
+      confidence,
+      probabilities: {
+        haiku: probabilities.haiku,
+        sonnet: probabilities.sonnet,
+        opus: probabilities.opus,
+        fable: probabilities.fable,
+      },
     };
   } catch {
     return null;
