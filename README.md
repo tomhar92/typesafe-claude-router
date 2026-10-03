@@ -46,36 +46,52 @@ context accounting) is forwarded unmodified and unlogged to Anthropic.
 
 ## Classifier backends
 
-The classifier talks to TypeSafe's `/v1/systemone` API through the
-official SDK, which reads two environment variables, so any server that
-implements the same wire format works without code changes:
+Two transports are built in, chosen with `ROUTER_CLASSIFIER`:
 
-```bash
-TYPESAFE_BASE_URL=http://localhost:8000 \
-TYPESAFE_DEFAULT_MODEL=<model name the server expects> \
-typesafe-claude-router run -- claude
-```
+- **`typesafe`** (default): TypeSafe's `/v1/systemone` API through the
+  official SDK. The SDK reads `TYPESAFE_BASE_URL` and
+  `TYPESAFE_DEFAULT_MODEL`, so any server that implements the same wire
+  format works without code changes:
 
-`TYPESAFE_API_KEY` is only required for TypeSafe's hosted API; the router
-checks this at startup and prints which endpoint and model it is using.
-Open and third-party decision models that advertise a TypeSafe-compatible
-`/v1/systemone` endpoint (for example OpenJev, or models served by Ollaya)
-are candidates, but **this repo has not tested any of them**.
+  ```bash
+  TYPESAFE_BASE_URL=http://localhost:8000 \
+  TYPESAFE_DEFAULT_MODEL=<model name the server expects> \
+  typesafe-claude-router run -- claude
+  ```
+
+  `TYPESAFE_API_KEY` is only required for TypeSafe's hosted API.
+- **`openrouter`**: OpenRouter's alpha Decisions endpoint
+  (`POST /api/alpha/decisions`):
+
+  ```bash
+  ROUTER_CLASSIFIER=openrouter OPENROUTER_API_KEY=... \
+    typesafe-claude-router run -- claude
+  ```
+
+  This is written against OpenRouter's published schema and unit-tested
+  with a mocked `fetch`; it has **not** been exercised against the live
+  endpoint, which is marked alpha and may change. `ROUTER_CLASSIFIER_MODEL`
+  picks the model (default `~typesafe/jev-latest`).
+
+The router checks the backend settings at startup and prints which
+endpoint and model it is using. Open and third-party decision models that
+advertise a TypeSafe-compatible `/v1/systemone` endpoint (for example
+OpenJev, or models served by Ollaya) are candidates, but **this repo has
+not tested any of them**. Other hosted formats need an adapter; the
+`ClassifierBackend` interface in `src/classifierBackend.ts` is the seam.
 
 Things to check before trusting a different backend:
 
 - **Calibration.** The margin thresholds were chosen for Jev's probability
   distributions. A smaller model may be overconfident or flat. Run it in
   shadow mode first and read the report.
-- **All four tiers come back.** An answer missing any tier's probability
-  is treated as no answer (logged as `classifier-unavailable`).
-- **Where the payload goes.** The "What leaves your machine" caveats apply
-  to hosted backends; a model on `localhost` keeps the payload on your
+- **Every answer is validated.** An unknown tier name, a missing
+  confidence, or fewer than four tier probabilities is treated as no
+  answer (logged as `classifier-unavailable`), whatever the transport.
+- **Where the payload goes.** The "What leaves your machine" caveats and
+  payload bounds apply to every hosted backend (with OpenRouter and its
+  provider in the path); a model on `localhost` keeps the payload on your
   machine.
-
-Hosted services that use a different request format (for example
-OpenRouter's `/api/alpha/decisions`) are not supported yet and would need
-an adapter.
 
 ## Setup
 
@@ -175,25 +191,6 @@ TypeSafe calls through your machine. Only widen it (e.g. `HOST=0.0.0.0`
 in a container) if you understand that tradeoff. Additionally, requests
 carrying `Origin` or a cross-site `Sec-Fetch-Site` are refused, because a
 page in an already-open browser can otherwise reach loopback.
-
-### Using OpenRouter for classification
-
-```bash
-ROUTER_CLASSIFIER=openrouter OPENROUTER_API_KEY=... \
-  typesafe-claude-router run -- claude
-```
-
-This sends the classifier question to OpenRouter's alpha Decisions
-endpoint (`POST /api/alpha/decisions`) instead of TypeSafe's own API. It
-is written against OpenRouter's published schema and unit-tested with a
-mocked `fetch`; it has **not** been exercised against the live endpoint,
-which is marked alpha and may change. The same payload bounds and
-"what leaves your machine" caveats apply, with OpenRouter and its
-provider in the path.
-
-Whatever the transport, the router validates every answer: an unknown tier
-name, a missing confidence, or fewer than four tier probabilities is
-treated as no answer (logged as `classifier-unavailable`).
 
 Pricing (`src/pricing.ts`) reflects research done 2026-09-19 and **will
 drift** — check current Claude API pricing before trusting real spend

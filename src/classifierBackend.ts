@@ -91,7 +91,7 @@ export interface OpenRouterBackendOptions {
  * differs is the path, and that `confidence` and `probabilities` are
  * optional in its response schema. */
 export function openRouterBackend(options: OpenRouterBackendOptions): ClassifierBackend {
-  const { apiKey, model, baseURL = "https://openrouter.ai", fetch: fetchImpl = fetch } = options;
+  const { apiKey, model, baseURL = DEFAULT_OPENROUTER_BASE_URL, fetch: fetchImpl = fetch } = options;
   const url = `${baseURL.replace(/\/+$/, "")}/api/alpha/decisions`;
   return {
     async choose(request, { timeoutMs, signal }) {
@@ -133,10 +133,18 @@ export function openRouterBackend(options: OpenRouterBackendOptions): Classifier
 
 const BACKEND_NAMES = ["typesafe", "openrouter"];
 
+export const DEFAULT_OPENROUTER_BASE_URL = "https://openrouter.ai";
+export const DEFAULT_OPENROUTER_MODEL = "~typesafe/jev-latest";
+
+/** Which backend the environment selects (unvalidated). */
+export function backendName(env: NodeJS.ProcessEnv): string {
+  return env.ROUTER_CLASSIFIER?.trim() || "typesafe";
+}
+
 /** Problems with the classifier-backend settings, for the startup check to
  * report before the first turn instead of as a silent per-turn failure. */
 export function validateBackendConfig(env: NodeJS.ProcessEnv): string[] {
-  const name = env.ROUTER_CLASSIFIER?.trim() || "typesafe";
+  const name = backendName(env);
   if (!BACKEND_NAMES.includes(name)) {
     return [`ROUTER_CLASSIFIER=${name} is not a known backend (expected one of: ${BACKEND_NAMES.join(", ")}).`];
   }
@@ -152,10 +160,10 @@ export function validateBackendConfig(env: NodeJS.ProcessEnv): string[] {
 export function backendFromEnv(env: NodeJS.ProcessEnv): ClassifierBackend {
   const problems = validateBackendConfig(env);
   if (problems.length > 0) throw new Error(problems[0]);
-  if ((env.ROUTER_CLASSIFIER?.trim() || "typesafe") === "openrouter") {
+  if (backendName(env) === "openrouter") {
     return openRouterBackend({
       apiKey: env.OPENROUTER_API_KEY!.trim(),
-      model: env.ROUTER_CLASSIFIER_MODEL?.trim() || "~typesafe/jev-latest",
+      model: env.ROUTER_CLASSIFIER_MODEL?.trim() || DEFAULT_OPENROUTER_MODEL,
       baseURL: env.OPENROUTER_BASE_URL?.trim() || undefined,
     });
   }

@@ -3,6 +3,12 @@ import { getOrInitState, updateState } from "./conversationKey.js";
 import { decide, DEFAULT_LIMITS } from "./policy.js";
 import { computeMargins } from "./margins.js";
 import { classifyTurn, type ClassifyInput, type ClassifyOptions } from "./classify.js";
+import {
+  backendName,
+  DEFAULT_OPENROUTER_BASE_URL,
+  DEFAULT_OPENROUTER_MODEL,
+  validateBackendConfig,
+} from "./classifierBackend.js";
 import { DEFAULT_PRICING, tierForModel, computeCostUsd } from "./pricing.js";
 import { appendLedgerLine } from "./ledger.js";
 import { extractLatestUserText, sanitizeForClassifier } from "./classifyInput.js";
@@ -559,10 +565,13 @@ const HOSTED_BACKEND_HOST = "api.typesafe.ai";
  * `classifier-unavailable` on every turn and looks like a flaky API.
  */
 export function validateStartupConfig(env: NodeJS.ProcessEnv): string[] {
-  const problems: string[] = [];
+  const problems: string[] = validateBackendConfig(env);
   const baseURL = env.TYPESAFE_BASE_URL?.trim();
-  let keyRequired = true;
-  if (baseURL) {
+  // TypeSafe's key and base URL only matter when that is the backend in
+  // use; an OpenRouter user has no reason to set either.
+  const usesTypeSafe = backendName(env) === "typesafe";
+  let keyRequired = usesTypeSafe;
+  if (usesTypeSafe && baseURL) {
     try {
       // Only TypeSafe's hosted API is known to need a key. A self-hosted
       // /v1/systemone server (OpenJev, Ollaya, ...) frequently has none,
@@ -589,6 +598,10 @@ export function validateStartupConfig(env: NodeJS.ProcessEnv): string[] {
  * operator can see at startup whether turns are going to a hosted API or a
  * local model. */
 export function describeBackend(env: NodeJS.ProcessEnv): string {
+  if (backendName(env) === "openrouter") {
+    const base = (env.OPENROUTER_BASE_URL?.trim() || DEFAULT_OPENROUTER_BASE_URL).replace(/\/+$/, "");
+    return `${base} (model ${env.ROUTER_CLASSIFIER_MODEL?.trim() || DEFAULT_OPENROUTER_MODEL})`;
+  }
   const baseURL = (env.TYPESAFE_BASE_URL?.trim() || `https://${HOSTED_BACKEND_HOST}`).replace(/\/+$/, "");
   return `${baseURL} (model ${env.TYPESAFE_DEFAULT_MODEL?.trim() || "jev-latest"})`;
 }
@@ -600,7 +613,8 @@ export function describeBackend(env: NodeJS.ProcessEnv): string {
 export function reportStartupProblems(env: NodeJS.ProcessEnv): boolean {
   const problems = validateStartupConfig(env);
   for (const problem of problems) console.warn(`warning: ${problem}`);
-  return problems.some((p) => p.startsWith("TYPESAFE_API_KEY") || p.startsWith("TYPESAFE_BASE_URL"));
+  const fatal = ["TYPESAFE_API_KEY", "TYPESAFE_BASE_URL", "OPENROUTER_API_KEY", "ROUTER_CLASSIFIER"];
+  return problems.some((p) => fatal.some((prefix) => p.startsWith(prefix)));
 }
 
 if (isMainModule(import.meta.url)) {

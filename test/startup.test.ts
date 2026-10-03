@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { validateStartupConfig, describeBackend } from "../src/server.js";
+import { validateStartupConfig, describeBackend, reportStartupProblems } from "../src/server.js";
 import { run } from "../bin/router.js";
 
 test("refuses to start silently without a TypeSafe key", () => {
@@ -70,4 +70,43 @@ test("describeBackend names the endpoint and model in use", () => {
     "http://localhost:8000 (model openjev-4b)"
   );
   assert.equal(describeBackend({}), "https://api.typesafe.ai (model jev-latest)");
+});
+
+test("openrouter backend: needs OPENROUTER_API_KEY, not TYPESAFE_API_KEY", () => {
+  assert.deepEqual(
+    validateStartupConfig({ ROUTER_CLASSIFIER: "openrouter", OPENROUTER_API_KEY: "k" }),
+    []
+  );
+  const problems = validateStartupConfig({ ROUTER_CLASSIFIER: "openrouter" });
+  assert.equal(problems.length, 1);
+  assert.match(problems[0], /OPENROUTER_API_KEY/);
+});
+
+test("an unknown ROUTER_CLASSIFIER is reported", () => {
+  const problems = validateStartupConfig({ TYPESAFE_API_KEY: "k", ROUTER_CLASSIFIER: "nope" });
+  assert.equal(problems.length, 1);
+  assert.match(problems[0], /ROUTER_CLASSIFIER/);
+});
+
+test("reportStartupProblems aborts on a bad backend config but not on the spend warning", () => {
+  const quiet = console.warn;
+  console.warn = () => {};
+  try {
+    assert.equal(reportStartupProblems({ ROUTER_CLASSIFIER: "openrouter" }), true);
+    assert.equal(reportStartupProblems({ ROUTER_CLASSIFIER: "nope", TYPESAFE_API_KEY: "k" }), true);
+    assert.equal(reportStartupProblems({ TYPESAFE_API_KEY: "k", ROUTER_MODE: "live" }), false);
+  } finally {
+    console.warn = quiet;
+  }
+});
+
+test("describeBackend names OpenRouter and its model", () => {
+  assert.equal(
+    describeBackend({ ROUTER_CLASSIFIER: "openrouter" }),
+    "https://openrouter.ai (model ~typesafe/jev-latest)"
+  );
+  assert.equal(
+    describeBackend({ ROUTER_CLASSIFIER: "openrouter", ROUTER_CLASSIFIER_MODEL: "typesafe/jev-1.13" }),
+    "https://openrouter.ai (model typesafe/jev-1.13)"
+  );
 });
