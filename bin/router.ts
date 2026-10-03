@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 import { spawn } from "node:child_process";
-import { createProxyServer, reportStartupProblems } from "../src/server.js";
+import { createProxyServer, describeBackend, reportStartupProblems } from "../src/server.js";
 import { isMainModule } from "../src/isMainModule.js";
 import { reportMain } from "./report.js";
 
@@ -62,6 +62,7 @@ if (isMainModule(import.meta.url)) {
     createProxyServer().listen(port, host, () => {
       const mode = process.env.ROUTER_MODE === "live" ? "live" : "shadow";
       console.log(`typesafe-claude-router listening on http://${host}:${port} (mode=${mode})`);
+      console.log(`classifier: ${describeBackend(process.env)}`);
     });
   } else {
     console.error(USAGE);

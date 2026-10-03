@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { validateStartupConfig } from "../src/server.js";
+import { validateStartupConfig, describeBackend } from "../src/server.js";
 import { run } from "../bin/router.js";
 
 test("refuses to start silently without a TypeSafe key", () => {
@@ -47,4 +47,27 @@ test("run propagates a non-zero exit code from the child", async () => {
 
 test("run with no command is a usage error", async () => {
   assert.equal(await run([]), 1);
+});
+
+test("does not demand a key for a self-hosted /v1/systemone endpoint", () => {
+  assert.deepEqual(validateStartupConfig({ TYPESAFE_BASE_URL: "http://localhost:8000" }), []);
+});
+
+test("still demands a key when the base URL is TypeSafe's hosted API", () => {
+  const problems = validateStartupConfig({ TYPESAFE_BASE_URL: "https://api.typesafe.ai/" });
+  assert.match(problems[0], /TYPESAFE_API_KEY/);
+});
+
+test("treats an unparseable base URL as a problem rather than guessing", () => {
+  const problems = validateStartupConfig({ TYPESAFE_API_KEY: "k", TYPESAFE_BASE_URL: "not a url" });
+  assert.equal(problems.length, 1);
+  assert.match(problems[0], /TYPESAFE_BASE_URL/);
+});
+
+test("describeBackend names the endpoint and model in use", () => {
+  assert.equal(
+    describeBackend({ TYPESAFE_BASE_URL: "http://localhost:8000", TYPESAFE_DEFAULT_MODEL: "openjev-4b" }),
+    "http://localhost:8000 (model openjev-4b)"
+  );
+  assert.equal(describeBackend({}), "https://api.typesafe.ai (model jev-latest)");
 });

@@ -32,8 +32,9 @@ Full design rationale: `docs/superpowers/specs/2026-09-19-typesafe-router-design
 ## What leaves your machine
 
 Every turn, the last 6 messages of the conversation (including tool
-results and file contents read into the session) are sent to TypeSafe's
-API for classification, in addition to the normal Anthropic API traffic.
+results and file contents read into the session) are sent to the
+classifier backend (TypeSafe's hosted API by default; see "Classifier
+backends" below), in addition to the normal Anthropic API traffic.
 The payload is bounded: image blocks are omitted, each string is truncated
 at 2,000 characters, and the whole payload is capped at roughly 24,000
 characters. The caps reduce the exposure, they do not eliminate it - if
@@ -42,6 +43,39 @@ that's not acceptable for a given session or codebase, don't point
 
 All non-`/v1/messages` traffic (such as `/v1/messages/count_tokens` for
 context accounting) is forwarded unmodified and unlogged to Anthropic.
+
+## Classifier backends
+
+The classifier talks to TypeSafe's `/v1/systemone` API through the
+official SDK, which reads two environment variables, so any server that
+implements the same wire format works without code changes:
+
+```bash
+TYPESAFE_BASE_URL=http://localhost:8000 \
+TYPESAFE_DEFAULT_MODEL=<model name the server expects> \
+typesafe-claude-router run -- claude
+```
+
+`TYPESAFE_API_KEY` is only required for TypeSafe's hosted API; the router
+checks this at startup and prints which endpoint and model it is using.
+Open and third-party decision models that advertise a TypeSafe-compatible
+`/v1/systemone` endpoint (for example OpenJev, or models served by Ollaya)
+are candidates, but **this repo has not tested any of them**.
+
+Things to check before trusting a different backend:
+
+- **Calibration.** The margin thresholds were chosen for Jev's probability
+  distributions. A smaller model may be overconfident or flat. Run it in
+  shadow mode first and read the report.
+- **All four tiers come back.** An answer missing any tier's probability
+  is treated as no answer (logged as `classifier-unavailable`).
+- **Where the payload goes.** The "What leaves your machine" caveats apply
+  to hosted backends; a model on `localhost` keeps the payload on your
+  machine.
+
+Hosted services that use a different request format (for example
+OpenRouter's `/api/alpha/decisions`) are not supported yet and would need
+an adapter.
 
 ## Setup
 
@@ -113,7 +147,9 @@ The router warns at startup if live mode has no `ROUTER_MAX_TIER`.
 
 | Env var | Purpose | Default |
 | --- | --- | --- |
-| `TYPESAFE_API_KEY` | TypeSafe auth (required) | — |
+| `TYPESAFE_API_KEY` | TypeSafe auth (required for the hosted API, optional for a self-hosted `TYPESAFE_BASE_URL`) | — |
+| `TYPESAFE_BASE_URL` | Classifier API root; any `/v1/systemone`-compatible server | `https://api.typesafe.ai` |
+| `TYPESAFE_DEFAULT_MODEL` | Classifier model name sent to that server | `jev-latest` |
 | `ROUTER_MODE` | `shadow` or `live` | `shadow` |
 | `ROUTER_LEDGER_PATH` | Where turn-by-turn cost data is logged | `./router-ledger.jsonl` |
 | `PORT` | Local proxy port | `8787` |
