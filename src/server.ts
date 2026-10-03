@@ -2,7 +2,7 @@ import { createServer, type IncomingMessage, type ServerResponse } from "node:ht
 import { getOrInitState, updateState } from "./conversationKey.js";
 import { decide, DEFAULT_LIMITS } from "./policy.js";
 import { computeMargins } from "./margins.js";
-import { classifyTurn, type ClassifyInput } from "./classify.js";
+import { classifyTurn, type ClassifyInput, type ClassifyOptions } from "./classify.js";
 import { DEFAULT_PRICING, tierForModel, computeCostUsd } from "./pricing.js";
 import { appendLedgerLine } from "./ledger.js";
 import { extractLatestUserText, sanitizeForClassifier } from "./classifyInput.js";
@@ -16,7 +16,7 @@ export interface ServerOptions {
   mode?: "shadow" | "live";
   ledgerPath?: string;
   pricing?: PricingConfig;
-  classify?: (input: ClassifyInput) => Promise<ClassifyResult | null>;
+  classify?: (input: ClassifyInput, options?: ClassifyOptions) => Promise<ClassifyResult | null>;
   /** Hard cap on a buffered request body. Default 64 MiB, or
    * ROUTER_MAX_BODY_BYTES. */
   maxBodyBytes?: number;
@@ -323,11 +323,15 @@ export async function handleMessages(
   const messages: any[] = Array.isArray(body.messages) ? body.messages : [];
   const latestUserMessage = extractLatestUserText(messages);
 
-  // TODO(PR 7): Pass signal to classify once classifyTurn supports it
-  const classification = await classify({
-    recentMessages: sanitizeForClassifier(messages.slice(-6)),
-    latestUserMessage,
-  });
+  // Passing the request signal means a client disconnect cancels the
+  // classification too, instead of leaving a billed request in flight.
+  const classification = await classify(
+    {
+      recentMessages: sanitizeForClassifier(messages.slice(-6)),
+      latestUserMessage,
+    },
+    { signal }
+  );
   if (!classification) {
     console.warn(
       "typesafe-claude-router: classifier unavailable this turn (TypeSafe error or timeout) - holding current tier"
