@@ -28,6 +28,30 @@ export function extractLatestUserText(messages: unknown[]): string {
   return "";
 }
 
+/** True when the request is the next step of an agentic loop rather than a
+ * new user turn: the last message is the user role and carries tool
+ * results. The tier was already settled for the user message that started
+ * the loop, and switching mid-loop would only rebuild the prompt cache.
+ * Text next to the results is ignored on purpose: Claude Code appends
+ * system reminders and skill bodies there, and telling those apart from
+ * something the user typed mid-loop is guesswork. Missing the rare typed
+ * message costs one unclassified step; the next real turn is classified. */
+export function isToolResultContinuation(messages: unknown[]): boolean {
+  const last = messages[messages.length - 1] as { role?: unknown; content?: unknown } | undefined;
+  if (last?.role !== "user" || !Array.isArray(last.content)) return false;
+  return (last.content as { type?: unknown }[]).some((block) => block?.type === "tool_result");
+}
+
+/** Claude Code's own side calls (the quota ping, prompt summaries, web-page
+ * summarizers) send no tools, while every main-thread and subagent request
+ * carries the tool list. They share sockets with the main thread, so
+ * treating them as conversation turns both bills a classifier call for
+ * each and breaks the prefix comparison for the real turn that follows,
+ * which then reads as a reset. */
+export function isSideRequest(body: { tools?: unknown }): boolean {
+  return !Array.isArray(body.tools) || body.tools.length === 0;
+}
+
 export function sanitizeForClassifier(messages: unknown[]): JsonValue[] {
   let budget = MAX_TOTAL_CHARS;
 

@@ -65,8 +65,8 @@ are candidates, but **this repo has not tested any of them**.
 Things to check before trusting a different backend:
 
 - **Calibration.** The margin thresholds were chosen for Jev's probability
-  distributions. A smaller model may be overconfident or flat. Run it in
-  shadow mode first and read the report.
+  distributions. A smaller model may be overconfident or flat. Run it
+  with a tight `ROUTER_MIN_TIER`/`ROUTER_MAX_TIER` first and read the report.
 - **All four tiers come back.** An answer missing any tier's probability
   is treated as no answer (logged as `classifier-unavailable`).
 - **Where the payload goes.** The "What leaves your machine" caveats apply
@@ -86,8 +86,7 @@ export TYPESAFE_API_KEY=...      # from typesafe.ai
 npx typesafe-claude-router run -- claude
 ```
 
-`run` starts the proxy on an ephemeral loopback port in shadow mode,
-launches the command after `--` with `ANTHROPIC_BASE_URL` pointed at it,
+`run` starts the proxy on an ephemeral loopback port, launches the command after `--` with `ANTHROPIC_BASE_URL` pointed at it,
 and shuts the proxy down when the command exits. Your normal Anthropic
 auth is passed through untouched. The router refuses to start without
 `TYPESAFE_API_KEY` rather than quietly logging `classifier-unavailable`
@@ -102,7 +101,7 @@ command on your PATH.
 If you want one long-lived proxy for several sessions, use two terminals:
 
 ```bash
-typesafe-claude-router serve     # 127.0.0.1:8787, shadow mode (PORT/HOST to change)
+typesafe-claude-router serve     # 127.0.0.1:8787 (PORT/HOST to change)
 ```
 
 ```bash
@@ -114,9 +113,9 @@ From a clone without `npm link`, `npm start` is the same as `serve`.
 
 ### Reading the results
 
-Shadow mode (the default) never changes which model actually serves a
-turn — it only logs what it *would* have done. Watch `./router-ledger.jsonl`
-fill in during a real session, then run:
+The router switches models for real: a switch decision rewrites the
+`model` field of the request. Every turn is also logged, so watch
+`./router-ledger.jsonl` fill in during a session, then run:
 
 ```bash
 typesafe-claude-router report            # or: report path/to/ledger.jsonl
@@ -125,23 +124,23 @@ typesafe-claude-router report            # or: report path/to/ledger.jsonl
 The path defaults to `ROUTER_LEDGER_PATH`, then `./router-ledger.jsonl`.
 (From a clone: `npm run report`.)
 
-### Before enabling live mode
+### Before you rely on it
 
-Check, from a few real shadow-mode sessions, that:
+Routing is live from the first turn, so set a spend ceiling and check, from
+a few real sessions, that:
 
 - the report shows no (or very few) `classifier-unavailable` turns;
 - there are no `unknown-model` turns, or you have added those models to
   `modelAlias` in `src/pricing.ts`;
-- the decisions the router *would* have made look sensible for the work you
-  were actually doing.
+- the answers from downgraded turns are as good as you need.
 
-Then let it switch models, with a spend ceiling:
+A cautious first run limits how far the router can move:
 
 ```bash
-ROUTER_MODE=live ROUTER_MAX_TIER=opus typesafe-claude-router run -- claude
+ROUTER_MIN_TIER=sonnet ROUTER_MAX_TIER=opus typesafe-claude-router run -- claude
 ```
 
-The router warns at startup if live mode has no `ROUTER_MAX_TIER`.
+The router warns at startup if there is no `ROUTER_MAX_TIER`.
 
 ## Configuration
 
@@ -150,7 +149,6 @@ The router warns at startup if live mode has no `ROUTER_MAX_TIER`.
 | `TYPESAFE_API_KEY` | TypeSafe auth (required for the hosted API, optional for a self-hosted `TYPESAFE_BASE_URL`) | — |
 | `TYPESAFE_BASE_URL` | Classifier API root; any `/v1/systemone`-compatible server | `https://api.typesafe.ai` |
 | `TYPESAFE_DEFAULT_MODEL` | Classifier model name sent to that server | `jev-latest` |
-| `ROUTER_MODE` | `shadow` or `live` | `shadow` |
 | `ROUTER_LEDGER_PATH` | Where turn-by-turn cost data is logged | `./router-ledger.jsonl` |
 | `PORT` | Local proxy port | `8787` |
 | `HOST` | Interface the proxy binds to | `127.0.0.1` |
@@ -162,7 +160,7 @@ The router warns at startup if live mode has no `ROUTER_MAX_TIER`.
 | `ROUTER_MAX_BODY_BYTES` | Hard cap on a buffered request body | `67108864` |
 | `ANTHROPIC_DEFAULT_HAIKU_MODEL` / `_SONNET_` / `_OPUS_` / `_FABLE_MODEL` | Which real model each tier maps to | see `src/pricing.ts` |
 
-When enabling live mode for the first time, set `ROUTER_MAX_TIER=opus` to limit routing to the cheaper tiers while you verify the router is working as expected.
+When first trying the router, set `ROUTER_MAX_TIER=opus` to limit routing to the cheaper tiers while you verify the router is working as expected.
 
 `HOST` defaults to loopback-only: the proxy has no auth of its own (it
 relies on whatever `ANTHROPIC_API_KEY` the client sends through), so
@@ -185,8 +183,7 @@ numbers from the report.
   own environment before relying on the sticky/break-even logic.
 - The upgrade-suggestion note is injected as conversation content for the
   model to relay, not a UI element — it depends on the model choosing to
-  mention it. It's only injected in `live` mode, to keep `shadow` mode's
-  "never changes what actually happens" contract honest; it also perturbs
+  mention it. It also perturbs
   the cache prefix for the following turn, a small extra cost beyond the
   estimate it reports.
 - If TypeSafe errors or times out on a turn, the router holds the current

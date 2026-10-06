@@ -9,6 +9,8 @@ export interface Summary {
   upgradedOnReset: number;
   suggested: number;
   classifierUnavailable: number;
+  skippedToolResult: number;
+  sideRequests: number;
   unknownModel: number;
   totalActualUsd: number;
   totalCounterfactualUsd: number;
@@ -30,11 +32,21 @@ export function summarize(lines: LedgerLine[]): Summary {
     upgradedOnReset: lines.filter((l) => l.decision === "upgraded-on-reset").length,
     suggested: lines.filter((l) => l.decision === "upgrade-suggested").length,
     classifierUnavailable: lines.filter((l) => l.decision === "classifier-unavailable").length,
+    skippedToolResult: lines.filter((l) => l.decision === "skipped-tool-result").length,
+    sideRequests: lines.filter((l) => l.decision === "side-request").length,
     unknownModel: lines.filter((l) => l.decision === "unknown-model").length,
     totalActualUsd,
     totalCounterfactualUsd,
     deltaUsd: totalActualUsd - totalCounterfactualUsd,
   };
+}
+
+/** Judged at the four decimals the report prints, so a zero delta (or
+ * floating-point dust around one) reads as "no change" rather than "cost more". */
+export function deltaLabel(deltaUsd: number): string {
+  const rounded = Number(deltaUsd.toFixed(4));
+  if (rounded === 0) return "no change";
+  return rounded < 0 ? "saved" : "cost more";
 }
 
 const USAGE = "Usage: typesafe-claude-router-report [path-to-ledger.jsonl]";
@@ -67,6 +79,16 @@ export function reportMain(argv: string[]): void {
       `  classifier-unavailable: ${s.classifierUnavailable} (TypeSafe errored/timed out - router held by default, not by policy, on these turns)`
     );
   }
+  if (s.sideRequests > 0) {
+    console.log(
+      `  side-request: ${s.sideRequests} (Claude Code's tool-less side calls - passed through, never routed, still costed)`
+    );
+  }
+  if (s.skippedToolResult > 0) {
+    console.log(
+      `  skipped-tool-result: ${s.skippedToolResult} (agentic-loop steps, not classified - stayed on the tier chosen for the user message)`
+    );
+  }
   if (s.unknownModel > 0) {
     console.log(
       `  unknown-model: ${s.unknownModel} (no tier resolved - forwarded untouched, not priced; add the model to modelAlias in src/pricing.ts)`
@@ -75,7 +97,7 @@ export function reportMain(argv: string[]): void {
   console.log(`Actual cost:         $${s.totalActualUsd.toFixed(4)}`);
   console.log(`No-routing baseline: $${s.totalCounterfactualUsd.toFixed(4)}`);
   console.log(
-    `Delta:               $${s.deltaUsd.toFixed(4)} (${s.deltaUsd < 0 ? "saved" : "cost more"})`
+    `Delta:               $${s.deltaUsd.toFixed(4)} (${deltaLabel(s.deltaUsd)})`
   );
 }
 

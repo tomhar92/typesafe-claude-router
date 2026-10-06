@@ -1,6 +1,11 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { extractLatestUserText, sanitizeForClassifier } from "../src/classifyInput.js";
+import {
+  extractLatestUserText,
+  isSideRequest,
+  isToolResultContinuation,
+  sanitizeForClassifier,
+} from "../src/classifyInput.js";
 
 test("keeps scanning back when the last user message is only tool results", () => {
   const messages = [
@@ -38,4 +43,43 @@ test("stops spending characters once the total budget is exhausted", () => {
   const big = { role: "user", content: [{ type: "text", text: "y".repeat(2000) }] };
   const sanitized = sanitizeForClassifier(Array.from({ length: 40 }, () => big));
   assert.ok(JSON.stringify(sanitized).length < 30_000);
+});
+
+const TOOL_USE = { role: "assistant", content: [{ type: "tool_use", id: "1", name: "Read", input: {} }] };
+const TOOL_RESULT = { type: "tool_result", tool_use_id: "1", content: "file text" };
+
+test("a user message of only tool results continues the turn", () => {
+  const messages = [{ role: "user", content: "fix it" }, TOOL_USE, { role: "user", content: [TOOL_RESULT] }];
+  assert.equal(isToolResultContinuation(messages), true);
+});
+
+test("text next to tool results (reminders, skill bodies) does not make it a new user turn", () => {
+  const messages = [
+    TOOL_USE,
+    {
+      role: "user",
+      content: [
+        TOOL_RESULT,
+        { type: "text", text: "<system-reminder>\nnote\n</system-reminder>" },
+        { type: "text", text: "Base directory for this skill: /x" },
+      ],
+    },
+  ];
+  assert.equal(isToolResultContinuation(messages), true);
+});
+
+test("a plain user prompt is not a continuation", () => {
+  assert.equal(isToolResultContinuation([{ role: "user", content: "hi" }]), false);
+  assert.equal(isToolResultContinuation([{ role: "user", content: [{ type: "text", text: "hi" }] }]), false);
+});
+
+test("an empty or assistant-last request is not a continuation", () => {
+  assert.equal(isToolResultContinuation([]), false);
+  assert.equal(isToolResultContinuation([{ role: "assistant", content: "hi" }]), false);
+});
+
+test("a request with no tools is a side request; one with tools is not", () => {
+  assert.equal(isSideRequest({}), true);
+  assert.equal(isSideRequest({ tools: [] }), true);
+  assert.equal(isSideRequest({ tools: [{ name: "Read" }] }), false);
 });
