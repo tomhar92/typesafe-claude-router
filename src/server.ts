@@ -1,5 +1,6 @@
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
-import { getOrInitState, updateState } from "./conversationKey.js";
+import { createConversationStore, updateState } from "./conversationKey.js";
+import type { ConversationStore } from "./conversationKey.js";
 import { decide, DEFAULT_LIMITS } from "./policy.js";
 import { computeMargins } from "./margins.js";
 import { classifyTurn, type ClassifyInput, type ClassifyOptions } from "./classify.js";
@@ -203,7 +204,8 @@ export async function handleMessages(
   req: IncomingMessage,
   res: ServerResponse,
   options: ServerOptions = {},
-  signal: AbortSignal = new AbortController().signal
+  signal: AbortSignal = new AbortController().signal,
+  conversations: ConversationStore = createConversationStore()
 ): Promise<void> {
   const upstream = options.upstream ?? "https://api.anthropic.com";
   const ledgerPath =
@@ -287,8 +289,10 @@ export async function handleMessages(
   // (billed) classifier call entirely, and still record the turn so the
   // report can surface how often this happens. A run full of
   // `unknown-model` lines means the alias table needs a new entry.
+  const messages: any[] = Array.isArray(body.messages) ? body.messages : [];
+
   if (requestedTier === null) {
-    const state = getOrInitState(req.socket, "sonnet");
+    const state = conversations.getOrInitState(req.socket, "sonnet", messages);
     const { response, usage } = await forwardAndStream(req, res, body, upstream, signal);
     if (response.ok) {
       // The turn still happened and still grew the conversation, even
@@ -299,7 +303,6 @@ export async function handleMessages(
       // reset, which bypasses decide()'s margin/sticky/break-even
       // safeguards. decisionTier is state.currentTier (unchanged) because
       // this turn made no tier decision to record.
-      const messages: any[] = Array.isArray(body.messages) ? body.messages : [];
       updateState(
         state,
         state.currentTier,
@@ -342,7 +345,7 @@ export async function handleMessages(
   // everything past this guard can treat the request's model as a plain
   // string rather than the `unknown` it started as.
   const requestedModelString = requestedModel as string;
-  const state = getOrInitState(req.socket, requestedTier);
+  const state = conversations.getOrInitState(req.socket, requestedTier, messages);
 
   // Claude Code re-sends whatever tier it thinks the session is on. If that
   // no longer matches what we tracked last turn, the user changed it
@@ -376,7 +379,6 @@ export async function handleMessages(
     state.currentTier = requestedTier;
   }
 
-  const messages: any[] = Array.isArray(body.messages) ? body.messages : [];
   const latestUserMessage = extractLatestUserText(messages);
 
   // A tool-result continuation is the next step of a turn whose tier was
@@ -561,6 +563,7 @@ function rejectsAsBrowserRequest(req: IncomingMessage, res: ServerResponse): boo
 }
 
 export function createProxyServer(options: ServerOptions = {}) {
+  const conversations = createConversationStore();
   return createServer((req, res) => {
     if (rejectsAsBrowserRequest(req, res)) return;
     // A client that hangs up mid-turn should not leave us paying for a
@@ -582,7 +585,7 @@ export function createProxyServer(options: ServerOptions = {}) {
     }
 
     const run = routed
-      ? handleMessages(req, res, options, abort.signal)
+      ? handleMessages(req, res, options, abort.signal, conversations)
       : passThroughRequest(req, res, options, abort.signal);
 
     run.catch((err) => {

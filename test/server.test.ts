@@ -283,6 +283,83 @@ test("leaves the request body and beta header alone when the tier is not rewritt
   fake.close();
 });
 
+test("a conversation that moves to a new connection is not mistaken for a reset", async () => {
+  let calls = 0;
+  const fake = await withFakeUpstream(() => ({
+    status: 200,
+    usage: { input_tokens: 100, output_tokens: 50, cache_creation_input_tokens: 100, cache_read_input_tokens: 0 },
+    text: "ok",
+  }));
+  const ledgerPath = join(mkdtempSync(join(tmpdir(), "ledger-")), "ledger.jsonl");
+  const router = createProxyServer({
+    upstream: fake.url,
+    ledgerPath,
+    classify: async () => {
+      calls += 1;
+      return calls === 1
+        ? { choice: "haiku", confidence: 0.95, probabilities: { haiku: 0.95, sonnet: 0.03, opus: 0.01, fable: 0.01 } }
+        : { choice: "opus", confidence: 0.95, probabilities: { haiku: 0.01, sonnet: 0.02, opus: 0.95, fable: 0.02 } };
+    },
+  });
+  const port = await listen(router);
+
+  const first = { role: "user", content: [{ type: "text", text: "easy first prompt" }] };
+  const reply = { role: "assistant", content: [{ type: "text", text: "ok" }] };
+  const second = { role: "user", content: [{ type: "text", text: "now something hard" }] };
+  // Claude Code keeps asking for its own default every turn.
+  const model = DEFAULT_PRICING.modelAlias.sonnet;
+
+  // Turn one on one connection, turn two (same conversation, grown history)
+  // on a brand-new one - the situation that used to read as a reset and
+  // upgrade without asking.
+  const a = new Agent({ keepAlive: true });
+  const b = new Agent({ keepAlive: true });
+  await postOnSharedSocket(a, port, { model, tools: TOOLS, messages: [first] });
+  await postOnSharedSocket(b, port, { model, tools: TOOLS, messages: [first, reply, second] });
+  a.destroy();
+  b.destroy();
+
+  const lines = readLedger(ledgerPath);
+  assert.equal(lines[0].decision, "downgraded-on-reset");
+  assert.equal(lines[1].conversationKey, lines[0].conversationKey);
+  assert.equal(lines[1].decision, "upgrade-suggested");
+  assert.equal(lines[1].actualModel, DEFAULT_PRICING.modelAlias.haiku);
+
+  router.close();
+  fake.close();
+});
+
+test("a different first message on the same connection is a separate conversation", async () => {
+  const fake = await withFakeUpstream(() => ({
+    status: 200,
+    usage: { input_tokens: 10, output_tokens: 5, cache_creation_input_tokens: 0, cache_read_input_tokens: 0 },
+    text: "ok",
+  }));
+  const ledgerPath = join(mkdtempSync(join(tmpdir(), "ledger-")), "ledger.jsonl");
+  const router = createProxyServer({
+    upstream: fake.url,
+    ledgerPath,
+    classify: async () => ({
+      choice: "sonnet",
+      confidence: 0.9,
+      probabilities: { haiku: 0.05, sonnet: 0.9, opus: 0.03, fable: 0.02 },
+    }),
+  });
+  const port = await listen(router);
+
+  const agent = new Agent({ keepAlive: true, maxSockets: 1 });
+  const model = DEFAULT_PRICING.modelAlias.sonnet;
+  await postOnSharedSocket(agent, port, { model, tools: TOOLS, messages: [{ role: "user", content: "task one" }] });
+  await postOnSharedSocket(agent, port, { model, tools: TOOLS, messages: [{ role: "user", content: "task two" }] });
+  agent.destroy();
+
+  const lines = readLedger(ledgerPath);
+  assert.notEqual(lines[0].conversationKey, lines[1].conversationKey);
+
+  router.close();
+  fake.close();
+});
+
 test("a downgrade stays sticky on the next turn even though Claude Code keeps resending its own default model", async () => {
   const fake = await withFakeUpstream(() => ({
     status: 200,

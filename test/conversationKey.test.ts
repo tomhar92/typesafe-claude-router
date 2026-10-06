@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { getOrInitState, updateState } from "../src/conversationKey.js";
+import { createConversationStore, getOrInitState, updateState } from "../src/conversationKey.js";
 
 test("initializes state on first use and returns the same object on reuse", () => {
   const socket = {};
@@ -59,4 +59,38 @@ test("turnsOnCurrentTier accumulates while the tier stays the same and resets on
   assert.equal(state.turnsOnCurrentTier, 2);
   updateState(state, "haiku", usage, []);
   assert.equal(state.turnsOnCurrentTier, 1);
+});
+
+test("the same first message is one conversation across sockets; cache_control does not matter", () => {
+  const store = createConversationStore();
+  const plain = [{ role: "user", content: [{ type: "text", text: "hello" }] }];
+  const marked = [{ role: "user", content: [{ type: "text", text: "hello", cache_control: { type: "ephemeral" } }] }];
+  const a = store.getOrInitState({}, "sonnet", plain);
+  const b = store.getOrInitState({}, "haiku", marked);
+  assert.equal(a, b);
+  assert.equal(b.currentTier, "sonnet");
+});
+
+test("a different first message is a different conversation, even on the same socket", () => {
+  const store = createConversationStore();
+  const socket = {};
+  const a = store.getOrInitState(socket, "sonnet", [{ role: "user", content: "one" }]);
+  const b = store.getOrInitState(socket, "sonnet", [{ role: "user", content: "two" }]);
+  assert.notEqual(a, b);
+  assert.notEqual(a.connectionId, b.connectionId);
+});
+
+test("with no messages it falls back to the socket", () => {
+  const store = createConversationStore();
+  const socket = {};
+  assert.equal(store.getOrInitState(socket, "sonnet"), store.getOrInitState(socket, "opus"));
+  assert.notEqual(store.getOrInitState({}, "sonnet"), store.getOrInitState({}, "sonnet"));
+});
+
+test("two stores never share a conversation", () => {
+  const messages = [{ role: "user", content: "same" }];
+  assert.notEqual(
+    createConversationStore().getOrInitState({}, "sonnet", messages),
+    createConversationStore().getOrInitState({}, "sonnet", messages)
+  );
 });
