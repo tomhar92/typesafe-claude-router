@@ -7,7 +7,7 @@
 // entirely (it always sees "reset" and adopts the raw classifier choice).
 // Strip `cache_control` before comparing so only real content changes -
 // edits, rewinds, `/clear`, `/compact` - count as a reset.
-function stripCacheControl(value: unknown): unknown {
+export function stripCacheControl(value: unknown): unknown {
   if (Array.isArray(value)) {
     return value.map(stripCacheControl);
   }

@@ -176,11 +176,14 @@ numbers from the report.
 
 ## Known limitations (v1)
 
-- Conversation identity is keyed by the TCP connection Claude Code holds
-  open, not a stable session ID (Anthropic's API doesn't send one). If
-  Claude Code's HTTP client doesn't keep that connection alive across
-  turns, routing state won't persist between turns — verify this in your
-  own environment before relying on the sticky/break-even logic.
+- Conversation identity is a hash of the conversation's first message,
+  not the TCP connection (Anthropic's API sends no session ID, and Claude
+  Code opens new connections mid-conversation and shares one between the
+  main thread and subagents). `/clear`, `/compact` and each subagent start
+  with a different first message, so they count as new conversations. Two
+  sessions that open with an identical first message would share routing
+  state. State is held in memory (the 500 most recent conversations) and is
+  lost on restart.
 - Claude Code builds each request for the model it is using, so a request
   moved to Haiku is reshaped to match what Claude Code itself sends for
   Haiku (`src/adaptRequest.ts`: output cap, thinking mode, effort,
