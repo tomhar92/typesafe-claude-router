@@ -181,6 +181,12 @@ numbers from the report.
   Claude Code's HTTP client doesn't keep that connection alive across
   turns, routing state won't persist between turns — verify this in your
   own environment before relying on the sticky/break-even logic.
+- Claude Code builds each request for the model it is using, so a request
+  moved to Haiku is reshaped to match what Claude Code itself sends for
+  Haiku (`src/adaptRequest.ts`: output cap, thinking mode, effort,
+  `system`-role messages, beta flags). That is modelled on one captured
+  Sonnet/Haiku pair and will drift as Claude Code changes; if routed
+  Haiku turns start returning 400s, set `ROUTER_MIN_TIER=sonnet`.
 - The upgrade-suggestion note is injected as conversation content for the
   model to relay, not a UI element — it depends on the model choosing to
   mention it. It also perturbs

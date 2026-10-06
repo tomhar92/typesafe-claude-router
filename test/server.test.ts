@@ -62,18 +62,20 @@ async function withFakeUpstream(
   respond: (body: any) => { status: number; usage: Record<string, number>; text: string }
 ) {
   let lastBody: any = null;
+  let lastHeaders: Record<string, unknown> = {};
   const fake = createServer((req, res) => {
     const chunks: Buffer[] = [];
     req.on("data", (c) => chunks.push(c));
     req.on("end", () => {
       lastBody = JSON.parse(Buffer.concat(chunks).toString("utf8"));
+      lastHeaders = req.headers;
       const { status, usage, text } = respond(lastBody);
       res.writeHead(status, { "content-type": "application/json" });
       res.end(JSON.stringify({ type: "message", content: [{ type: "text", text }], usage }));
     });
   });
   const port = await listen(fake);
-  return { url: `http://127.0.0.1:${port}`, close: () => fake.close(), getLastBody: () => lastBody };
+  return { url: `http://127.0.0.1:${port}`, close: () => fake.close(), getLastBody: () => lastBody, getLastHeaders: () => lastHeaders };
 }
 
 test("holds tier, passes model through untouched, and logs real usage", async () => {
@@ -185,6 +187,97 @@ test("rewrites the model field in live mode on a reset-window downgrade", async 
 
   const lines = readLedger(ledgerPath);
   assert.equal(lines[0].decision, "downgraded-on-reset");
+
+  router.close();
+  fake.close();
+});
+
+test("reshapes a Sonnet-built request for Haiku: caps, thinking, effort, system messages and beta flags", async () => {
+  const fake = await withFakeUpstream(() => ({
+    status: 200,
+    usage: { input_tokens: 100, output_tokens: 50, cache_creation_input_tokens: 100, cache_read_input_tokens: 0 },
+    text: "ok",
+  }));
+
+  const router = createProxyServer({
+    upstream: fake.url,
+    ledgerPath: join(mkdtempSync(join(tmpdir(), "ledger-")), "ledger.jsonl"),
+    classify: async () => ({
+      choice: "haiku",
+      confidence: 0.9,
+      probabilities: { haiku: 0.9, sonnet: 0.05, opus: 0.03, fable: 0.02 },
+    }),
+  });
+  const port = await listen(router);
+
+  await fetch(`http://127.0.0.1:${port}/v1/messages`, {
+    method: "POST",
+    headers: {
+      "content-type": "application/json",
+      "anthropic-beta": "claude-code-20250219,mid-conversation-system-2026-04-07,effort-2025-11-24,context-management-2025-06-27",
+    },
+    body: JSON.stringify({
+      model: DEFAULT_PRICING.modelAlias.sonnet,
+      max_tokens: 128000,
+      thinking: { type: "adaptive" },
+      output_config: { effort: "high" },
+      tools: TOOLS,
+      messages: [
+        { role: "user", content: [{ type: "text", text: "are the skies blue?" }] },
+        { role: "system", content: [{ type: "text", text: "plan mode is on" }] },
+      ],
+    }),
+  });
+
+  const sent = fake.getLastBody();
+  assert.equal(sent.model, DEFAULT_PRICING.modelAlias.haiku);
+  assert.equal(sent.max_tokens, 32000);
+  assert.deepEqual(sent.thinking, { type: "enabled", budget_tokens: 31999 });
+  assert.equal("output_config" in sent, false);
+  assert.deepEqual(sent.messages.map((m: any) => m.role), ["user"]);
+  assert.equal(sent.messages[0].content.length, 2);
+  assert.match(sent.messages[0].content[1].text, /plan mode is on/);
+  assert.equal(fake.getLastHeaders()["anthropic-beta"], "claude-code-20250219,context-management-2025-06-27");
+
+  router.close();
+  fake.close();
+});
+
+test("leaves the request body and beta header alone when the tier is not rewritten", async () => {
+  const fake = await withFakeUpstream(() => ({
+    status: 200,
+    usage: { input_tokens: 10, output_tokens: 5, cache_creation_input_tokens: 0, cache_read_input_tokens: 0 },
+    text: "ok",
+  }));
+  const router = createProxyServer({
+    upstream: fake.url,
+    ledgerPath: join(mkdtempSync(join(tmpdir(), "ledger-")), "ledger.jsonl"),
+    classify: async () => ({
+      choice: "sonnet",
+      confidence: 0.9,
+      probabilities: { haiku: 0.05, sonnet: 0.9, opus: 0.03, fable: 0.02 },
+    }),
+  });
+  const port = await listen(router);
+
+  await fetch(`http://127.0.0.1:${port}/v1/messages`, {
+    method: "POST",
+    headers: { "content-type": "application/json", "anthropic-beta": "effort-2025-11-24" },
+    body: JSON.stringify({
+      model: DEFAULT_PRICING.modelAlias.sonnet,
+      max_tokens: 128000,
+      thinking: { type: "adaptive" },
+      output_config: { effort: "high" },
+      tools: TOOLS,
+      messages: [{ role: "user", content: "hi" }, { role: "system", content: "x" }],
+    }),
+  });
+
+  const sent = fake.getLastBody();
+  assert.equal(sent.max_tokens, 128000);
+  assert.deepEqual(sent.thinking, { type: "adaptive" });
+  assert.deepEqual(sent.messages.map((m: any) => m.role), ["user", "system"]);
+  assert.equal(fake.getLastHeaders()["anthropic-beta"], "effort-2025-11-24");
 
   router.close();
   fake.close();
