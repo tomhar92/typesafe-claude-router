@@ -4,6 +4,7 @@ import { decide, DEFAULT_LIMITS } from "./policy.js";
 import { computeMargins } from "./margins.js";
 import { classifyTurn, type ClassifyInput, type ClassifyOptions } from "./classify.js";
 import { DEFAULT_PRICING, tierForModel, computeCostUsd } from "./pricing.js";
+import { adaptBetaHeader, adaptBodyForTier } from "./adaptRequest.js";
 import { appendLedgerLine } from "./ledger.js";
 import {
   extractLatestUserText,
@@ -108,7 +109,8 @@ async function forwardAndStream(
   res: ServerResponse,
   body: unknown,
   upstream: string,
-  signal: AbortSignal
+  signal: AbortSignal,
+  rewrittenToTier?: Tier
 ): Promise<{ response: Response; usage: UsageTotals }> {
   const upstreamHeaders = new Headers();
   for (const [key, value] of Object.entries(req.headers)) {
@@ -117,6 +119,12 @@ async function forwardAndStream(
   }
   upstreamHeaders.delete("host");
   upstreamHeaders.delete("content-length");
+  const betas = upstreamHeaders.get("anthropic-beta");
+  if (rewrittenToTier && betas) {
+    const adapted = adaptBetaHeader(betas, rewrittenToTier);
+    if (adapted === null) upstreamHeaders.delete("anthropic-beta");
+    else upstreamHeaders.set("anthropic-beta", adapted);
+  }
 
   const response = await fetch(`${upstream}/v1/messages`, {
     method: "POST",
@@ -433,6 +441,7 @@ export async function handleMessages(
   if (targetTier !== requestedTier) {
     outgoingModel = pricing.modelAlias[targetTier];
     body.model = outgoingModel;
+    adaptBodyForTier(body, targetTier);
   }
 
   // The note is injected into the conversation content the model sees,
@@ -449,7 +458,9 @@ export async function handleMessages(
     }
   }
 
-  const { response: upstreamResponse, usage } = await forwardAndStream(req, res, body, upstream, signal);
+  const { response: upstreamResponse, usage } = await forwardAndStream(
+    req, res, body, upstream, signal, targetTier !== requestedTier ? targetTier : undefined
+  );
 
   const actualModel = outgoingModel;
   const actualTier = tierForModel(pricing, actualModel) ?? targetTier;
