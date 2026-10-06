@@ -18,9 +18,11 @@ This router is built around that constraint:
 - **Downgrades** (to a cheaper tier) only happen automatically when the
   projected savings clear the one-time switch tax within a conservative
   number of turns.
-- **Upgrades** (to a pricier tier) are never applied automatically —
-  they're surfaced as an in-context note with the estimated cost, and
-  it's your call whether to act on it.
+- **Upgrades** (to a pricier tier) are applied at those same reset
+  moments, when the classifier is confident enough. Mid-session they are
+  never applied automatically: the router appends a note under the model's
+  reply with the estimated cost and the `/model` command, and it's your
+  call whether to act on it.
 - Both are free to apply immediately at the moments the cache was going
   to be rebuilt anyway (session start, `/clear`, `/compact`).
 - Every turn's *real* token usage and cost gets logged, so you can
@@ -190,11 +192,11 @@ numbers from the report.
   `system`-role messages, beta flags). That is modelled on one captured
   Sonnet/Haiku pair and will drift as Claude Code changes; if routed
   Haiku turns start returning 400s, set `ROUTER_MIN_TIER=sonnet`.
-- The upgrade-suggestion note is injected as conversation content for the
-  model to relay, not a UI element — it depends on the model choosing to
-  mention it. It also perturbs
-  the cache prefix for the following turn, a small extra cost beyond the
-  estimate it reports.
+- The upgrade-suggestion note is added to the reply as an extra text
+  block, and only on a turn that ends normally (not when the model stops to
+  call a tool; the next turn suggests again if it still applies). Claude
+  Code keeps it in the conversation history like any other assistant text.
+  The request itself is never modified for it, so it does not touch the cache.
 - If TypeSafe errors or times out on a turn, the router holds the current
   tier and logs `decision: "classifier-unavailable"` (distinct from a
   genuine policy-driven `held`) so a broken API key doesn't quietly look

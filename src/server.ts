@@ -13,7 +13,8 @@ import {
   isToolResultContinuation,
   sanitizeForClassifier,
 } from "./classifyInput.js";
-import { buildUpgradeNoteBlock } from "./upgradeNote.js";
+import { buildUpgradeNoticeText } from "./upgradeNote.js";
+import { SseNoteInjector, injectNoteIntoJson } from "./responseNote.js";
 import { UsageAccumulator, type UsageTotals } from "./usage.js";
 import { isMainModule } from "./isMainModule.js";
 import type { PricingConfig, Tier, ClassifyResult } from "./types.js";
@@ -111,7 +112,8 @@ async function forwardAndStream(
   body: unknown,
   upstream: string,
   signal: AbortSignal,
-  rewrittenToTier?: Tier
+  rewrittenToTier?: Tier,
+  notice?: string
 ): Promise<{ response: Response; usage: UsageTotals }> {
   const upstreamHeaders = new Headers();
   for (const [key, value] of Object.entries(req.headers)) {
@@ -139,7 +141,25 @@ async function forwardAndStream(
   res.writeHead(response.status, responseHeaders);
 
   const accumulator = new UsageAccumulator();
-  if (response.body) {
+  const contentType = response.headers.get("content-type") ?? "";
+  const addNotice = notice !== undefined && response.ok && response.body !== null;
+  if (addNotice && contentType.includes("text/event-stream")) {
+    const injector = new SseNoteInjector(notice);
+    const reader = response.body!.getReader();
+    const decoder = new TextDecoder();
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      const text = decoder.decode(value, { stream: true });
+      accumulator.push(text);
+      res.write(injector.push(text));
+    }
+    res.write(injector.flush());
+  } else if (addNotice && contentType.includes("json")) {
+    const text = await response.text();
+    accumulator.push(text);
+    res.write(injectNoteIntoJson(text, notice));
+  } else if (response.body) {
     const reader = response.body.getReader();
     const decoder = new TextDecoder();
     for (;;) {
@@ -446,22 +466,17 @@ export async function handleMessages(
     adaptBodyForTier(body, targetTier);
   }
 
-  // The note is injected into the conversation content the model sees,
-  // so it is a real behavior change: it can change what the model says to
-  // the user. It only ever suggests; the user decides whether to act.
-  if (decision.kind === "upgrade-suggested" && messages.length > 0) {
-    const last = messages[messages.length - 1];
-    if (last.role === "user") {
-      const note = buildUpgradeNoteBlock(decision.to, decision.estimatedCostUsd);
-      const content = Array.isArray(last.content)
-        ? [...last.content, note]
-        : [{ type: "text", text: String(last.content ?? "") }, note];
-      body.messages = [...messages.slice(0, -1), { ...last, content }];
-    }
-  }
+  // A suggested upgrade is shown to the user under the model's reply, not
+  // injected into what the model sees: the request goes upstream unchanged,
+  // so the cache is untouched and the message does not depend on the model
+  // choosing to repeat it. It only ever suggests; the user decides.
+  const notice =
+    decision.kind === "upgrade-suggested"
+      ? buildUpgradeNoticeText(decision.to, decision.estimatedCostUsd)
+      : undefined;
 
   const { response: upstreamResponse, usage } = await forwardAndStream(
-    req, res, body, upstream, signal, targetTier !== requestedTier ? targetTier : undefined
+    req, res, body, upstream, signal, targetTier !== requestedTier ? targetTier : undefined, notice
   );
 
   const actualModel = outgoingModel;
