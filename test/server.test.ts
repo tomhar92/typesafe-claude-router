@@ -71,7 +71,7 @@ async function withFakeUpstream(
       lastHeaders = req.headers;
       const { status, usage, text } = respond(lastBody);
       res.writeHead(status, { "content-type": "application/json" });
-      res.end(JSON.stringify({ type: "message", content: [{ type: "text", text }], usage }));
+      res.end(JSON.stringify({ type: "message", content: [{ type: "text", text }], stop_reason: "end_turn", usage }));
     });
   });
   const port = await listen(fake);
@@ -863,16 +863,11 @@ test("a tool-less side request is forwarded and logged but never classified or c
   fake.close();
 });
 
-test("appends the upgrade-suggested note to the last user message and leaves earlier messages alone", async () => {
+test("an upgrade suggestion is added to the reply the user sees, and the request goes upstream unchanged", async () => {
   const fake = await withFakeUpstream(() => ({
     status: 200,
-    usage: {
-      input_tokens: 100,
-      output_tokens: 50,
-      cache_creation_input_tokens: 0,
-      cache_read_input_tokens: 0,
-    },
-    text: "ok",
+    usage: { input_tokens: 100, output_tokens: 50, cache_creation_input_tokens: 0, cache_read_input_tokens: 0 },
+    text: "here is my answer",
   }));
 
   const ledgerPath = join(mkdtempSync(join(tmpdir(), "ledger-")), "ledger.jsonl");
@@ -882,48 +877,97 @@ test("appends the upgrade-suggested note to the last user message and leaves ear
     ledgerPath,
     classify: async () => {
       call += 1;
-      // Turn 1 just establishes currentTier=sonnet via the reset branch
-      // (argmax equals the already-current tier -> held, no margin check
-      // involved). Turn 2 is a normal append, so the margin-based
-      // "upgrade-suggested" path is the one actually under test.
+      // Turn 1 settles on sonnet at the reset; turn 2 is a normal append,
+      // so the margin-based "upgrade-suggested" path is the one under test.
       return call === 1
         ? { choice: "sonnet", confidence: 0.8, probabilities: { haiku: 0.05, sonnet: 0.8, opus: 0.1, fable: 0.05 } }
         : { choice: "opus", confidence: 0.7, probabilities: { haiku: 0.05, sonnet: 0.15, opus: 0.7, fable: 0.1 } };
     },
   });
   const port = await listen(router);
-  const agent = new Agent({ keepAlive: true, maxSockets: 1 });
+  const post = (messages: unknown[]) =>
+    fetch(`http://127.0.0.1:${port}/v1/messages`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ model: DEFAULT_PRICING.modelAlias.sonnet, tools: TOOLS, messages }),
+    }).then((r) => r.json() as Promise<any>);
 
-  const turn1Messages = [{ role: "user", content: "first turn on this connection" }];
-  await postOnSharedSocket(agent, port, {
-    model: DEFAULT_PRICING.modelAlias.sonnet,
-    tools: TOOLS, messages: turn1Messages,
-  });
+  const turn1 = [{ role: "user", content: "first turn" }];
+  const first = await post(turn1);
+  assert.equal(first.content.length, 1);
 
-  const turn2Messages = [
-    ...turn1Messages,
-    { role: "assistant", content: "ok" },
-    { role: "user", content: "a genuinely hard architecture question" },
-  ];
-  await postOnSharedSocket(agent, port, {
-    model: DEFAULT_PRICING.modelAlias.sonnet,
-    tools: TOOLS, messages: turn2Messages,
-  });
+  const turn2 = [...turn1, { role: "assistant", content: "ok" }, { role: "user", content: "a genuinely hard question" }];
+  const second = await post(turn2);
 
   const lines = readLedger(ledgerPath);
-  assert.equal(lines.length, 2);
   assert.equal(lines[1].decision, "upgrade-suggested");
-  const sent = fake.getLastBody().messages;
-  assert.deepEqual(sent.slice(0, -1), turn2Messages.slice(0, -1));
-  const lastContent = sent[sent.length - 1].content;
-  assert.equal(lastContent.length, 2);
-  assert.deepEqual(lastContent[0], { type: "text", text: "a genuinely hard architecture question" });
-  assert.equal(lastContent[1].type, "text");
-  assert.match(lastContent[1].text, /opus/i);
+  // The model's own answer is untouched; the router's note follows it.
+  assert.equal(second.content[0].text, "here is my answer");
+  assert.equal(second.content.length, 2);
+  assert.match(second.content[1].text, /Router note/);
+  assert.match(second.content[1].text, /\/model opus/);
+  // What the model saw is exactly what Claude Code sent.
+  assert.deepEqual(fake.getLastBody().messages, turn2);
 
-  agent.destroy();
   router.close();
   fake.close();
+});
+
+test("a streamed reply gets the upgrade note as a final text block Claude Code can render", async () => {
+  const sseEvent = (type: string, data: Record<string, unknown>) =>
+    `event: ${type}\ndata: ${JSON.stringify({ type, ...data })}\n\n`;
+  const sseBody =
+    sseEvent("message_start", { message: { usage: { input_tokens: 10, cache_creation_input_tokens: 0, cache_read_input_tokens: 0 } } }) +
+    sseEvent("content_block_start", { index: 0, content_block: { type: "text", text: "" } }) +
+    sseEvent("content_block_delta", { index: 0, delta: { type: "text_delta", text: "streamed answer" } }) +
+    sseEvent("content_block_stop", { index: 0 }) +
+    sseEvent("message_delta", { delta: { stop_reason: "end_turn" }, usage: { output_tokens: 7 } }) +
+    sseEvent("message_stop", {});
+  const upstream = createServer((req, res) => {
+    req.resume();
+    req.on("end", () => {
+      res.writeHead(200, { "content-type": "text/event-stream" });
+      // Split mid-event to prove the relay reassembles before deciding.
+      res.write(sseBody.slice(0, 120));
+      res.end(sseBody.slice(120));
+    });
+  });
+  const upstreamPort = await listen(upstream);
+
+  let call = 0;
+  const router = createProxyServer({
+    upstream: `http://127.0.0.1:${upstreamPort}`,
+    ledgerPath: join(mkdtempSync(join(tmpdir(), "ledger-")), "ledger.jsonl"),
+    classify: async () => {
+      call += 1;
+      return call === 1
+        ? { choice: "sonnet", confidence: 0.8, probabilities: { haiku: 0.05, sonnet: 0.8, opus: 0.1, fable: 0.05 } }
+        : { choice: "opus", confidence: 0.7, probabilities: { haiku: 0.05, sonnet: 0.15, opus: 0.7, fable: 0.1 } };
+    },
+  });
+  const port = await listen(router);
+  const post = (messages: unknown[]) =>
+    fetch(`http://127.0.0.1:${port}/v1/messages`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ model: DEFAULT_PRICING.modelAlias.sonnet, tools: TOOLS, stream: true, messages }),
+    }).then((r) => r.text());
+
+  const turn1 = [{ role: "user", content: "first turn" }];
+  assert.ok(!(await post(turn1)).includes("Router note"));
+  const text = await post([...turn1, { role: "assistant", content: "ok" }, { role: "user", content: "hard question" }]);
+
+  const parsed = text.split("\n\n").filter(Boolean).map((e) => JSON.parse(e.split("\n")[1].slice(6)));
+  assert.deepEqual(
+    parsed.map((e) => e.type),
+    ["message_start", "content_block_start", "content_block_delta", "content_block_stop",
+     "content_block_start", "content_block_delta", "content_block_stop", "message_delta", "message_stop"]
+  );
+  assert.equal(parsed[4].index, 1);
+  assert.match(parsed[5].delta.text, /Router note/);
+
+  router.close();
+  upstream.close();
 });
 
 test("forwards an unrecognized model untouched and never calls the classifier", async () => {
