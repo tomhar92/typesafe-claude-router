@@ -13,21 +13,17 @@ test("treats a blank TypeSafe key as missing", () => {
   assert.match(validateStartupConfig({ TYPESAFE_API_KEY: "  " })[0], /TYPESAFE_API_KEY/);
 });
 
-test("warns when live mode runs with no ceiling on spend", () => {
-  const problems = validateStartupConfig({ TYPESAFE_API_KEY: "k", ROUTER_MODE: "live" });
+test("warns when there is no ceiling on spend", () => {
+  const problems = validateStartupConfig({ TYPESAFE_API_KEY: "k" });
   assert.equal(problems.length, 1);
   assert.match(problems[0], /ROUTER_MAX_TIER/);
 });
 
 test("is quiet on a complete configuration", () => {
   assert.deepEqual(
-    validateStartupConfig({ TYPESAFE_API_KEY: "k", ROUTER_MODE: "live", ROUTER_MAX_TIER: "opus" }),
+    validateStartupConfig({ TYPESAFE_API_KEY: "k", ROUTER_MAX_TIER: "opus" }),
     []
   );
-});
-
-test("is quiet in shadow mode with a key and no tier ceiling", () => {
-  assert.deepEqual(validateStartupConfig({ TYPESAFE_API_KEY: "k" }), []);
 });
 
 test("run points the child at a live proxy and returns its exit code", async () => {
@@ -50,7 +46,7 @@ test("run with no command is a usage error", async () => {
 });
 
 test("does not demand a key for a self-hosted /v1/systemone endpoint", () => {
-  assert.deepEqual(validateStartupConfig({ TYPESAFE_BASE_URL: "http://localhost:8000" }), []);
+  assert.deepEqual(validateStartupConfig({ TYPESAFE_BASE_URL: "http://localhost:8000", ROUTER_MAX_TIER: "opus" }), []);
 });
 
 test("still demands a key when the base URL is TypeSafe's hosted API", () => {
@@ -59,7 +55,7 @@ test("still demands a key when the base URL is TypeSafe's hosted API", () => {
 });
 
 test("treats an unparseable base URL as a problem rather than guessing", () => {
-  const problems = validateStartupConfig({ TYPESAFE_API_KEY: "k", TYPESAFE_BASE_URL: "not a url" });
+  const problems = validateStartupConfig({ TYPESAFE_API_KEY: "k", TYPESAFE_BASE_URL: "not a url", ROUTER_MAX_TIER: "opus" });
   assert.equal(problems.length, 1);
   assert.match(problems[0], /TYPESAFE_BASE_URL/);
 });

@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { summarize, resolveLedgerPath } from "../bin/report.js";
+import { summarize, resolveLedgerPath, deltaLabel } from "../bin/report.js";
 import type { LedgerLine } from "../src/ledger.js";
 
 function line(overrides: Partial<LedgerLine>): LedgerLine {
@@ -85,4 +85,12 @@ test("resolveLedgerPath: argument, then env, then default; --help yields null", 
   assert.equal(resolveLedgerPath([], { ROUTER_LEDGER_PATH: "b.jsonl" }), "b.jsonl");
   assert.equal(resolveLedgerPath([], {}), "./router-ledger.jsonl");
   assert.equal(resolveLedgerPath(["--help"], {}), null);
+});
+
+test("deltaLabel says no change for a zero or rounding-dust delta, not cost more", () => {
+  assert.equal(deltaLabel(0), "no change");
+  assert.equal(deltaLabel(1e-17), "no change");
+  assert.equal(deltaLabel(-0.00001), "no change");
+  assert.equal(deltaLabel(-0.0123), "saved");
+  assert.equal(deltaLabel(0.0123), "cost more");
 });

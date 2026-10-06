@@ -36,7 +36,6 @@ async function main() {
   const ledgerPath = join(mkdtempSync(join(tmpdir(), "ledger-")), "ledger.jsonl");
   const router = createProxyServer({
     upstream: `http://127.0.0.1:${fakePort}`,
-    mode: "shadow",
     ledgerPath,
     // Strongest probability is opus, which sits above ROUTER_MAX_TIER=sonnet.
     classify: async () => ({
@@ -57,6 +56,7 @@ async function main() {
     headers: { "content-type": "application/json" },
     body: JSON.stringify({
       model: DEFAULT_PRICING.modelAlias.sonnet,
+      tools: [{ name: "Read" }],
       messages: [{ role: "user", content: "hello" }],
     }),
   }).then((r) => r.text());

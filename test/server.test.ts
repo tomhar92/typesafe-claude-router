@@ -11,6 +11,10 @@ import { DEFAULT_PRICING } from "../src/pricing.js";
 import { execFileSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 
+// Claude Code's main-thread and subagent requests always carry tools; a
+// request with none is treated as a side call and never routed.
+const TOOLS = [{ name: "Read" }];
+
 const ledgerMarginsFixture = fileURLToPath(
   new URL("./fixtures/server-ledger-margins.ts", import.meta.url)
 );
@@ -82,7 +86,6 @@ test("holds tier, passes model through untouched, and logs real usage", async ()
   const ledgerPath = join(mkdtempSync(join(tmpdir(), "ledger-")), "ledger.jsonl");
   const router = createProxyServer({
     upstream: fake.url,
-    mode: "live",
     ledgerPath,
     classify: async () => ({
       choice: "sonnet",
@@ -97,7 +100,7 @@ test("holds tier, passes model through untouched, and logs real usage", async ()
     headers: { "content-type": "application/json" },
     body: JSON.stringify({
       model: DEFAULT_PRICING.modelAlias.sonnet,
-      messages: [{ role: "user", content: "hello" }],
+      tools: TOOLS, messages: [{ role: "user", content: "hello" }],
     }),
   });
   assert.equal(response.status, 200);
@@ -124,7 +127,6 @@ test("live mode leaves an exact model pin alone when the decision is held", asyn
   const ledgerPath = join(mkdtempSync(join(tmpdir(), "ledger-")), "ledger.jsonl");
   const router = createProxyServer({
     upstream: fake.url,
-    mode: "live",
     ledgerPath,
     classify: async () => ({
       choice: "opus",
@@ -139,7 +141,7 @@ test("live mode leaves an exact model pin alone when the decision is held", asyn
     headers: { "content-type": "application/json" },
     body: JSON.stringify({
       model: "claude-opus-5-20260101",
-      messages: [{ role: "user", content: "hello" }],
+      tools: TOOLS, messages: [{ role: "user", content: "hello" }],
     }),
   });
   await response.text();
@@ -161,7 +163,6 @@ test("rewrites the model field in live mode on a reset-window downgrade", async 
   const ledgerPath = join(mkdtempSync(join(tmpdir(), "ledger-")), "ledger.jsonl");
   const router = createProxyServer({
     upstream: fake.url,
-    mode: "live",
     ledgerPath,
     classify: async () => ({
       choice: "haiku",
@@ -176,49 +177,12 @@ test("rewrites the model field in live mode on a reset-window downgrade", async 
     headers: { "content-type": "application/json" },
     body: JSON.stringify({
       model: DEFAULT_PRICING.modelAlias.sonnet,
-      messages: [{ role: "user", content: "first turn on this connection" }],
+      tools: TOOLS, messages: [{ role: "user", content: "first turn on this connection" }],
     }),
   });
 
   assert.equal(fake.getLastBody().model, DEFAULT_PRICING.modelAlias.haiku);
 
-  const lines = readLedger(ledgerPath);
-  assert.equal(lines[0].decision, "downgraded-on-reset");
-
-  router.close();
-  fake.close();
-});
-
-test("shadow mode never rewrites the model even when the policy would switch", async () => {
-  const fake = await withFakeUpstream(() => ({
-    status: 200,
-    usage: { input_tokens: 100, output_tokens: 50, cache_creation_input_tokens: 100, cache_read_input_tokens: 0 },
-    text: "ok",
-  }));
-
-  const ledgerPath = join(mkdtempSync(join(tmpdir(), "ledger-")), "ledger.jsonl");
-  const router = createProxyServer({
-    upstream: fake.url,
-    mode: "shadow",
-    ledgerPath,
-    classify: async () => ({
-      choice: "haiku",
-      confidence: 0.9,
-      probabilities: { haiku: 0.9, sonnet: 0.05, opus: 0.03, fable: 0.02 },
-    }),
-  });
-  const port = await listen(router);
-
-  await fetch(`http://127.0.0.1:${port}/v1/messages`, {
-    method: "POST",
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify({
-      model: DEFAULT_PRICING.modelAlias.sonnet,
-      messages: [{ role: "user", content: "first turn" }],
-    }),
-  });
-
-  assert.equal(fake.getLastBody().model, DEFAULT_PRICING.modelAlias.sonnet);
   const lines = readLedger(ledgerPath);
   assert.equal(lines[0].decision, "downgraded-on-reset");
 
@@ -241,7 +205,6 @@ test("a downgrade stays sticky on the next turn even though Claude Code keeps re
   const ledgerPath = join(mkdtempSync(join(tmpdir(), "ledger-")), "ledger.jsonl");
   const router = createProxyServer({
     upstream: fake.url,
-    mode: "live",
     ledgerPath,
     classify: async () => ({
       choice: "haiku",
@@ -255,7 +218,7 @@ test("a downgrade stays sticky on the next turn even though Claude Code keeps re
   const turn1Messages = [{ role: "user", content: "first turn on this connection" }];
   await postOnSharedSocket(agent, port, {
     model: DEFAULT_PRICING.modelAlias.sonnet,
-    messages: turn1Messages,
+    tools: TOOLS, messages: turn1Messages,
   });
   assert.equal(fake.getLastBody().model, DEFAULT_PRICING.modelAlias.haiku);
 
@@ -269,7 +232,7 @@ test("a downgrade stays sticky on the next turn even though Claude Code keeps re
   ];
   await postOnSharedSocket(agent, port, {
     model: DEFAULT_PRICING.modelAlias.sonnet,
-    messages: turn2Messages,
+    tools: TOOLS, messages: turn2Messages,
   });
   assert.equal(
     fake.getLastBody().model,
@@ -334,7 +297,6 @@ test("logs real usage from a realistic streamed response, including a nested cac
   const ledgerPath = join(mkdtempSync(join(tmpdir(), "ledger-")), "ledger.jsonl");
   const router = createProxyServer({
     upstream: `http://127.0.0.1:${port0}`,
-    mode: "shadow",
     ledgerPath,
     classify: async () => ({
       choice: "sonnet",
@@ -349,7 +311,7 @@ test("logs real usage from a realistic streamed response, including a nested cac
     headers: { "content-type": "application/json" },
     body: JSON.stringify({
       model: DEFAULT_PRICING.modelAlias.sonnet,
-      messages: [{ role: "user", content: "hello" }],
+      tools: TOOLS, messages: [{ role: "user", content: "hello" }],
     }),
   });
   await response.text();
@@ -381,7 +343,6 @@ test("honors a manual model change instead of holding the router's previously tr
   let call = 0;
   const router = createProxyServer({
     upstream: fake.url,
-    mode: "live",
     ledgerPath,
     classify: async () => {
       call += 1;
@@ -396,7 +357,7 @@ test("honors a manual model change instead of holding the router's previously tr
   const turn1Messages = [{ role: "user", content: "first turn on this connection" }];
   await postOnSharedSocket(agent, port, {
     model: DEFAULT_PRICING.modelAlias.sonnet,
-    messages: turn1Messages,
+    tools: TOOLS, messages: turn1Messages,
   });
   assert.equal(fake.getLastBody().model, DEFAULT_PRICING.modelAlias.haiku);
 
@@ -408,7 +369,7 @@ test("honors a manual model change instead of holding the router's previously tr
   ];
   await postOnSharedSocket(agent, port, {
     model: DEFAULT_PRICING.modelAlias.opus,
-    messages: turn2Messages,
+    tools: TOOLS, messages: turn2Messages,
   });
   assert.equal(
     fake.getLastBody().model,
@@ -476,7 +437,6 @@ test("strips stale content-encoding/content-length instead of forwarding them al
   const ledgerPath = join(mkdtempSync(join(tmpdir(), "ledger-")), "ledger.jsonl");
   const router = createProxyServer({
     upstream: `http://127.0.0.1:${fakePort}`,
-    mode: "shadow",
     ledgerPath,
     classify: async () => null,
   });
@@ -487,7 +447,7 @@ test("strips stale content-encoding/content-length instead of forwarding them al
     headers: { "content-type": "application/json" },
     body: JSON.stringify({
       model: DEFAULT_PRICING.modelAlias.sonnet,
-      messages: [{ role: "user", content: "hi" }],
+      tools: TOOLS, messages: [{ role: "user", content: "hi" }],
     }),
   });
 
@@ -525,7 +485,6 @@ test("destroys the connection instead of appending an error body when the upstre
   const ledgerPath = join(mkdtempSync(join(tmpdir(), "ledger-")), "ledger.jsonl");
   const router = createProxyServer({
     upstream: `http://127.0.0.1:${fakePort}`,
-    mode: "shadow",
     ledgerPath,
     classify: async () => null,
   });
@@ -539,7 +498,7 @@ test("destroys the connection instead of appending an error body when the upstre
       headers: { "content-type": "application/json" },
       body: JSON.stringify({
         model: DEFAULT_PRICING.modelAlias.sonnet,
-        messages: [{ role: "user", content: "hi" }],
+        tools: TOOLS, messages: [{ role: "user", content: "hi" }],
       }),
     });
     bodyReceived = await response.text();
@@ -574,7 +533,6 @@ test("does not update routing state or write a ledger line for a non-2xx upstrea
   const ledgerPath = join(mkdtempSync(join(tmpdir(), "ledger-")), "ledger.jsonl");
   const router = createProxyServer({
     upstream: `http://127.0.0.1:${fakePort}`,
-    mode: "live",
     ledgerPath,
     classify: async () => ({
       choice: "haiku",
@@ -589,7 +547,7 @@ test("does not update routing state or write a ledger line for a non-2xx upstrea
     headers: { "content-type": "application/json" },
     body: JSON.stringify({
       model: DEFAULT_PRICING.modelAlias.sonnet,
-      messages: [{ role: "user", content: "hi" }],
+      tools: TOOLS, messages: [{ role: "user", content: "hi" }],
     }),
   });
   assert.equal(response.status, 429);
@@ -616,7 +574,6 @@ test("logs a distinct classifier-unavailable decision instead of masquerading as
   const ledgerPath = join(mkdtempSync(join(tmpdir(), "ledger-")), "ledger.jsonl");
   const router = createProxyServer({
     upstream: fake.url,
-    mode: "live",
     ledgerPath,
     classify: async () => null, // simulates a TypeSafe timeout/error
   });
@@ -627,7 +584,7 @@ test("logs a distinct classifier-unavailable decision instead of masquerading as
     headers: { "content-type": "application/json" },
     body: JSON.stringify({
       model: DEFAULT_PRICING.modelAlias.sonnet,
-      messages: [{ role: "user", content: "hi" }],
+      tools: TOOLS, messages: [{ role: "user", content: "hi" }],
     }),
   });
   await response.text();
@@ -641,7 +598,102 @@ test("logs a distinct classifier-unavailable decision instead of masquerading as
   fake.close();
 });
 
-test("gates the upgrade-suggested note to live mode, so shadow mode never changes what the model actually sees", async () => {
+test("does not classify a tool-result continuation, and logs it as its own decision", async () => {
+  const fake = await withFakeUpstream(() => ({
+    status: 200,
+    usage: { input_tokens: 100, output_tokens: 50, cache_creation_input_tokens: 0, cache_read_input_tokens: 0 },
+    text: "ok",
+  }));
+  let classifyCalls = 0;
+  const ledgerPath = join(mkdtempSync(join(tmpdir(), "ledger-")), "ledger.jsonl");
+  const router = createProxyServer({
+    upstream: fake.url,
+    ledgerPath,
+    classify: async () => {
+      classifyCalls += 1;
+      return {
+        choice: "haiku",
+        confidence: 0.9,
+        probabilities: { haiku: 0.9, sonnet: 0.05, opus: 0.03, fable: 0.02 },
+      };
+    },
+  });
+  const port = await listen(router);
+
+  const response = await fetch(`http://127.0.0.1:${port}/v1/messages`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({
+      model: DEFAULT_PRICING.modelAlias.sonnet,
+      tools: TOOLS, messages: [
+        { role: "user", content: "fix it" },
+        { role: "assistant", content: [{ type: "tool_use", id: "1", name: "Read", input: {} }] },
+        { role: "user", content: [{ type: "tool_result", tool_use_id: "1", content: "text" }] },
+      ],
+    }),
+  });
+  await response.text();
+
+  assert.equal(classifyCalls, 0);
+  const lines = readLedger(ledgerPath);
+  assert.equal(lines.length, 1);
+  assert.equal(lines[0].decision, "skipped-tool-result");
+  assert.equal(lines[0].actualTier, "sonnet");
+
+  router.close();
+  fake.close();
+});
+
+test("a tool-less side request is forwarded and logged but never classified or counted as a turn", async () => {
+  const fake = await withFakeUpstream(() => ({
+    status: 200,
+    usage: { input_tokens: 10, output_tokens: 5, cache_creation_input_tokens: 0, cache_read_input_tokens: 0 },
+    text: "ok",
+  }));
+  let classifyCalls = 0;
+  const ledgerPath = join(mkdtempSync(join(tmpdir(), "ledger-")), "ledger.jsonl");
+  const router = createProxyServer({
+    upstream: fake.url,
+    ledgerPath,
+    classify: async () => {
+      classifyCalls += 1;
+      return {
+        choice: "haiku",
+        confidence: 0.9,
+        probabilities: { haiku: 0.9, sonnet: 0.05, opus: 0.03, fable: 0.02 },
+      };
+    },
+  });
+  const port = await listen(router);
+  const agent = new Agent({ keepAlive: true, maxSockets: 1 });
+  const model = DEFAULT_PRICING.modelAlias.sonnet;
+  const mainMessages = [{ role: "user", content: "refactor the parser" }];
+
+  await postOnSharedSocket(agent, port, { model, tools: TOOLS, messages: mainMessages });
+  // A side call on the same socket, with unrelated messages and no tools.
+  await postOnSharedSocket(agent, port, { model, max_tokens: 1, messages: [{ role: "user", content: "quota" }] });
+  // The main thread continues; it must not look like a reset.
+  await postOnSharedSocket(agent, port, {
+    model,
+    tools: TOOLS,
+    messages: [...mainMessages, { role: "assistant", content: "done" }, { role: "user", content: "now the lexer" }],
+  });
+
+  assert.equal(classifyCalls, 2);
+  const lines = readLedger(ledgerPath);
+  assert.deepEqual(
+    lines.map((l) => l.decision),
+    ["downgraded-on-reset", "side-request", "held"]
+  );
+  assert.equal(lines[1].conversationKey, "side-request");
+  assert.equal(lines[2].resetDetected, false);
+
+  agent.destroy();
+  router.close();
+  fake.close();
+});
+
+test("appends the upgrade-suggested note to the last user message and leaves earlier messages alone", async () => {
   const fake = await withFakeUpstream(() => ({
     status: 200,
     usage: {
@@ -657,7 +709,6 @@ test("gates the upgrade-suggested note to live mode, so shadow mode never change
   let call = 0;
   const router = createProxyServer({
     upstream: fake.url,
-    mode: "shadow",
     ledgerPath,
     classify: async () => {
       call += 1;
@@ -676,7 +727,7 @@ test("gates the upgrade-suggested note to live mode, so shadow mode never change
   const turn1Messages = [{ role: "user", content: "first turn on this connection" }];
   await postOnSharedSocket(agent, port, {
     model: DEFAULT_PRICING.modelAlias.sonnet,
-    messages: turn1Messages,
+    tools: TOOLS, messages: turn1Messages,
   });
 
   const turn2Messages = [
@@ -686,17 +737,19 @@ test("gates the upgrade-suggested note to live mode, so shadow mode never change
   ];
   await postOnSharedSocket(agent, port, {
     model: DEFAULT_PRICING.modelAlias.sonnet,
-    messages: turn2Messages,
+    tools: TOOLS, messages: turn2Messages,
   });
 
   const lines = readLedger(ledgerPath);
   assert.equal(lines.length, 2);
   assert.equal(lines[1].decision, "upgrade-suggested");
-  assert.deepEqual(
-    fake.getLastBody().messages,
-    turn2Messages,
-    "shadow mode must not inject the upgrade note into what the model actually sees"
-  );
+  const sent = fake.getLastBody().messages;
+  assert.deepEqual(sent.slice(0, -1), turn2Messages.slice(0, -1));
+  const lastContent = sent[sent.length - 1].content;
+  assert.equal(lastContent.length, 2);
+  assert.deepEqual(lastContent[0], { type: "text", text: "a genuinely hard architecture question" });
+  assert.equal(lastContent[1].type, "text");
+  assert.match(lastContent[1].text, /opus/i);
 
   agent.destroy();
   router.close();
@@ -713,7 +766,6 @@ test("forwards an unrecognized model untouched and never calls the classifier", 
   let classifyCalls = 0;
   const router = createProxyServer({
     upstream: fake.url,
-    mode: "live",
     ledgerPath,
     classify: async () => {
       classifyCalls += 1;
@@ -725,7 +777,7 @@ test("forwards an unrecognized model untouched and never calls the classifier", 
   const response = await fetch(`http://127.0.0.1:${port}/v1/messages`, {
     method: "POST",
     headers: { "content-type": "application/json" },
-    body: JSON.stringify({ model: "gpt-4o", messages: [{ role: "user", content: "hi" }] }),
+    body: JSON.stringify({ model: "gpt-4o", tools: TOOLS, messages: [{ role: "user", content: "hi" }] }),
   });
   await response.text();
 
@@ -750,7 +802,6 @@ test("a missing model field routes through the unknown-model path with a safe ac
   let classifyCalls = 0;
   const router = createProxyServer({
     upstream: fake.url,
-    mode: "live",
     ledgerPath,
     classify: async () => {
       classifyCalls += 1;
@@ -766,7 +817,7 @@ test("a missing model field routes through the unknown-model path with a safe ac
   const response = await fetch(`http://127.0.0.1:${port}/v1/messages`, {
     method: "POST",
     headers: { "content-type": "application/json" },
-    body: JSON.stringify({ messages: [{ role: "user", content: "hi" }] }),
+    body: JSON.stringify({ tools: TOOLS, messages: [{ role: "user", content: "hi" }] }),
   });
   await response.text();
 
@@ -789,7 +840,6 @@ test("an unknown-model turn does not make the next resolvable-model turn look li
   const ledgerPath = join(mkdtempSync(join(tmpdir(), "ledger-")), "ledger.jsonl");
   const router = createProxyServer({
     upstream: fake.url,
-    mode: "live",
     ledgerPath,
     // A strong opus signal: if turn 2 is (wrongly) treated as a reset, decide()
     // takes the reset branch and immediately returns "upgraded-on-reset" for
@@ -808,7 +858,7 @@ test("an unknown-model turn does not make the next resolvable-model turn look li
   // Turn 1 on this connection uses a model with no resolvable tier - it
   // must be forwarded untouched, but the conversation still grew.
   const turn1Messages = [{ role: "user", content: "first turn on this connection" }];
-  await postOnSharedSocket(agent, port, { model: "gpt-4o", messages: turn1Messages });
+  await postOnSharedSocket(agent, port, { model: "gpt-4o", tools: TOOLS, messages: turn1Messages });
 
   // Turn 2 uses a real, resolvable model and simply continues the same
   // conversation (a real superset of turn 1's messages) - this must not be
@@ -821,7 +871,7 @@ test("an unknown-model turn does not make the next resolvable-model turn look li
   ];
   await postOnSharedSocket(agent, port, {
     model: DEFAULT_PRICING.modelAlias.sonnet,
-    messages: turn2Messages,
+    tools: TOOLS, messages: turn2Messages,
   });
 
   const lines = readLedger(ledgerPath);
@@ -848,7 +898,6 @@ test("a dated opus model is priced as opus, not as the sonnet fallback", async (
   const ledgerPath = join(mkdtempSync(join(tmpdir(), "ledger-")), "ledger.jsonl");
   const router = createProxyServer({
     upstream: fake.url,
-    mode: "shadow",
     ledgerPath,
     classify: async () => ({
       choice: "opus",
@@ -863,7 +912,7 @@ test("a dated opus model is priced as opus, not as the sonnet fallback", async (
     headers: { "content-type": "application/json" },
     body: JSON.stringify({
       model: "claude-opus-5-20260101",
-      messages: [{ role: "user", content: "hello" }],
+      tools: TOOLS, messages: [{ role: "user", content: "hello" }],
     }),
   });
   await response.text();
@@ -912,7 +961,6 @@ test("counterfactual reclassifies a router-caused rebuild as a cache read, not a
   let call = 0;
   const router = createProxyServer({
     upstream: fake.url,
-    mode: "live",
     ledgerPath,
     classify: async () => {
       call += 1;
@@ -927,7 +975,7 @@ test("counterfactual reclassifies a router-caused rebuild as a cache read, not a
   const turn1Messages = [{ role: "user", content: "first turn on this connection" }];
   await postOnSharedSocket(agent, port, {
     model: DEFAULT_PRICING.modelAlias.sonnet,
-    messages: turn1Messages,
+    tools: TOOLS, messages: turn1Messages,
   });
 
   const turn2Messages = [
@@ -937,7 +985,7 @@ test("counterfactual reclassifies a router-caused rebuild as a cache read, not a
   ];
   await postOnSharedSocket(agent, port, {
     model: DEFAULT_PRICING.modelAlias.sonnet,
-    messages: turn2Messages,
+    tools: TOOLS, messages: turn2Messages,
   });
 
   const lines = readLedger(ledgerPath);
@@ -974,7 +1022,6 @@ test("routes /v1/messages even when the client appends a query string", async ()
   const ledgerPath = join(mkdtempSync(join(tmpdir(), "ledger-")), "ledger.jsonl");
   const router = createProxyServer({
     upstream: fake.url,
-    mode: "shadow",
     ledgerPath,
     classify: async () => ({
       choice: "sonnet",
@@ -989,7 +1036,7 @@ test("routes /v1/messages even when the client appends a query string", async ()
     headers: { "content-type": "application/json" },
     body: JSON.stringify({
       model: DEFAULT_PRICING.modelAlias.sonnet,
-      messages: [{ role: "user", content: "hello" }],
+      tools: TOOLS, messages: [{ role: "user", content: "hello" }],
     }),
   });
   assert.equal(response.status, 200);
@@ -1006,13 +1053,13 @@ test("forwards an endpoint it does not route instead of 404ing it", async () => 
     res.end(JSON.stringify({ path: req.url, method: req.method }));
   });
   const fakePort = await listen(fake);
-  const router = createProxyServer({ upstream: `http://127.0.0.1:${fakePort}`, mode: "shadow" });
+  const router = createProxyServer({ upstream: `http://127.0.0.1:${fakePort}` });
   const port = await listen(router);
 
   const response = await fetch(`http://127.0.0.1:${port}/v1/messages/count_tokens`, {
     method: "POST",
     headers: { "content-type": "application/json" },
-    body: JSON.stringify({ model: "claude-sonnet-5", messages: [] }),
+    body: JSON.stringify({ model: "claude-sonnet-5", tools: TOOLS, messages: [] }),
   });
   assert.equal(response.status, 200);
   assert.deepEqual(await response.json(), { path: "/v1/messages/count_tokens", method: "POST" });
@@ -1038,7 +1085,6 @@ test("aborts the upstream request when the client hangs up mid-turn", async () =
     listen(servers.fake).then(async (fakePort) => {
       servers.router = createProxyServer({
         upstream: `http://127.0.0.1:${fakePort}`,
-        mode: "shadow",
         classify: async () => null,
       });
       const port = await listen(servers.router);
@@ -1046,7 +1092,7 @@ test("aborts the upstream request when the client hangs up mid-turn", async () =
       const pending = fetch(`http://127.0.0.1:${port}/v1/messages`, {
         method: "POST",
         headers: { "content-type": "application/json" },
-        body: JSON.stringify({ model: "claude-sonnet-5", messages: [{ role: "user", content: "hi" }] }),
+        body: JSON.stringify({ model: "claude-sonnet-5", tools: TOOLS, messages: [{ role: "user", content: "hi" }] }),
         signal: controller.signal,
       }).catch(() => {});
       setTimeout(() => controller.abort(), 50);
@@ -1074,13 +1120,13 @@ test("the ledger's logged upgradeMargin respects ROUTER_MAX_TIER instead of the 
 });
 
 test("rejects a request that carries browser provenance", async () => {
-  const router = createProxyServer({ mode: "shadow" });
+  const router = createProxyServer();
   const port = await listen(router);
 
   const response = await fetch(`http://127.0.0.1:${port}/v1/messages`, {
     method: "POST",
     headers: { "content-type": "application/json", origin: "https://evil.example" },
-    body: JSON.stringify({ model: "claude-sonnet-5", messages: [] }),
+    body: JSON.stringify({ model: "claude-sonnet-5", tools: TOOLS, messages: [] }),
   });
   assert.equal(response.status, 403);
 
@@ -1088,13 +1134,13 @@ test("rejects a request that carries browser provenance", async () => {
 });
 
 test("rejects a non-JSON content type on the routed endpoint", async () => {
-  const router = createProxyServer({ mode: "shadow" });
+  const router = createProxyServer();
   const port = await listen(router);
 
   const response = await fetch(`http://127.0.0.1:${port}/v1/messages`, {
     method: "POST",
     headers: { "content-type": "text/plain" },
-    body: JSON.stringify({ model: "claude-sonnet-5", messages: [] }),
+    body: JSON.stringify({ model: "claude-sonnet-5", tools: TOOLS, messages: [] }),
   });
   assert.equal(response.status, 415);
 
@@ -1102,13 +1148,13 @@ test("rejects a non-JSON content type on the routed endpoint", async () => {
 });
 
 test("rejects a body past the size cap instead of buffering it", async () => {
-  const router = createProxyServer({ mode: "shadow", maxBodyBytes: 1024 });
+  const router = createProxyServer({ maxBodyBytes: 1024 });
   const port = await listen(router);
 
   const response = await fetch(`http://127.0.0.1:${port}/v1/messages`, {
     method: "POST",
     headers: { "content-type": "application/json" },
-    body: JSON.stringify({ model: "claude-sonnet-5", pad: "x".repeat(4096), messages: [] }),
+    body: JSON.stringify({ model: "claude-sonnet-5", pad: "x".repeat(4096), tools: TOOLS, messages: [] }),
   });
   assert.equal(response.status, 413);
   assert.deepEqual(await response.json(), { error: "request_too_large" });
@@ -1120,13 +1166,13 @@ test("respects ROUTER_MAX_BODY_BYTES environment variable when no explicit optio
   const savedEnv = process.env.ROUTER_MAX_BODY_BYTES;
   try {
     process.env.ROUTER_MAX_BODY_BYTES = "1024";
-    const router = createProxyServer({ mode: "shadow" });
+    const router = createProxyServer();
     const port = await listen(router);
 
     const response = await fetch(`http://127.0.0.1:${port}/v1/messages`, {
       method: "POST",
       headers: { "content-type": "application/json" },
-      body: JSON.stringify({ model: "claude-sonnet-5", pad: "x".repeat(4096), messages: [] }),
+      body: JSON.stringify({ model: "claude-sonnet-5", pad: "x".repeat(4096), tools: TOOLS, messages: [] }),
     });
     assert.equal(response.status, 413);
 
@@ -1152,7 +1198,6 @@ test("treats an empty ROUTER_MAX_BODY_BYTES as unset instead of a 0-byte cap", a
     });
     const fakePort = await listen(fake);
     const router = createProxyServer({
-      mode: "shadow",
       upstream: `http://127.0.0.1:${fakePort}`,
       classify: async () => null,
     });
@@ -1161,7 +1206,7 @@ test("treats an empty ROUTER_MAX_BODY_BYTES as unset instead of a 0-byte cap", a
     const response = await fetch(`http://127.0.0.1:${port}/v1/messages`, {
       method: "POST",
       headers: { "content-type": "application/json" },
-      body: JSON.stringify({ model: "claude-sonnet-5", messages: [] }),
+      body: JSON.stringify({ model: "claude-sonnet-5", tools: TOOLS, messages: [] }),
     });
     assert.notEqual(response.status, 413);
 

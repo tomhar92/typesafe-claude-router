@@ -6,7 +6,7 @@ import { reportMain } from "./report.js";
 
 const USAGE = `typesafe-claude-router - cache-aware model tier router for Claude Code
 
-  typesafe-claude-router serve            start the proxy (PORT, HOST, ROUTER_MODE)
+  typesafe-claude-router serve            start the proxy (PORT, HOST)
   typesafe-claude-router run -- claude    start the proxy, run a command against it, tear down
   typesafe-claude-router report [path]    summarize a ledger
 `;
@@ -60,8 +60,7 @@ if (isMainModule(import.meta.url)) {
     const port = Number(process.env.PORT ?? 8787);
     const host = process.env.HOST ?? "127.0.0.1";
     createProxyServer().listen(port, host, () => {
-      const mode = process.env.ROUTER_MODE === "live" ? "live" : "shadow";
-      console.log(`typesafe-claude-router listening on http://${host}:${port} (mode=${mode})`);
+      console.log(`typesafe-claude-router listening on http://${host}:${port}`);
       console.log(`classifier: ${describeBackend(process.env)}`);
     });
   } else {

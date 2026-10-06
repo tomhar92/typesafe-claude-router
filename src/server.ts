@@ -5,7 +5,12 @@ import { computeMargins } from "./margins.js";
 import { classifyTurn, type ClassifyInput, type ClassifyOptions } from "./classify.js";
 import { DEFAULT_PRICING, tierForModel, computeCostUsd } from "./pricing.js";
 import { appendLedgerLine } from "./ledger.js";
-import { extractLatestUserText, sanitizeForClassifier } from "./classifyInput.js";
+import {
+  extractLatestUserText,
+  isSideRequest,
+  isToolResultContinuation,
+  sanitizeForClassifier,
+} from "./classifyInput.js";
 import { buildUpgradeNoteBlock } from "./upgradeNote.js";
 import { UsageAccumulator, type UsageTotals } from "./usage.js";
 import { isMainModule } from "./isMainModule.js";
@@ -13,7 +18,6 @@ import type { PricingConfig, Tier, ClassifyResult } from "./types.js";
 
 export interface ServerOptions {
   upstream?: string;
-  mode?: "shadow" | "live";
   ledgerPath?: string;
   pricing?: PricingConfig;
   classify?: (input: ClassifyInput, options?: ClassifyOptions) => Promise<ClassifyResult | null>;
@@ -194,7 +198,6 @@ export async function handleMessages(
   signal: AbortSignal = new AbortController().signal
 ): Promise<void> {
   const upstream = options.upstream ?? "https://api.anthropic.com";
-  const mode = options.mode ?? (process.env.ROUTER_MODE === "live" ? "live" : "shadow");
   const ledgerPath =
     options.ledgerPath ?? process.env.ROUTER_LEDGER_PATH ?? "./router-ledger.jsonl";
   const pricing = options.pricing ?? DEFAULT_PRICING;
@@ -223,6 +226,51 @@ export async function handleMessages(
 
   const requestedModel: unknown = body.model;
   const requestedTier = tierForModel(pricing, requestedModel);
+
+  // Claude Code's own side calls (quota ping, prompt summaries, web-page
+  // summarizers) carry no tools and share sockets with the main thread.
+  // Forward them untouched and leave the conversation state alone: counting
+  // one as a turn would bill a classifier call for it and make the next
+  // real turn look like a reset. They still cost money, so they are logged.
+  if (isSideRequest(body)) {
+    const { response, usage } = await forwardAndStream(req, res, body, upstream, signal);
+    if (response.ok) {
+      const cost =
+        requestedTier === null
+          ? null
+          : computeCostUsd(
+              pricing,
+              requestedTier,
+              usage.inputTokens,
+              usage.outputTokens,
+              usage.cacheCreationTokens,
+              usage.cacheReadTokens
+            );
+      appendLedgerLine(ledgerPath, {
+        v: 2,
+        ts: new Date().toISOString(),
+        conversationKey: "side-request",
+        probabilities: {} as Record<Tier, number>,
+        confidence: null,
+        downgradeMargin: 0,
+        upgradeMargin: 0,
+        decision: "side-request",
+        resetDetected: false,
+        suggestedUpgradeTo: null,
+        suggestedUpgradeCostUsd: null,
+        actualModel: String(requestedModel ?? ""),
+        actualTier: requestedTier,
+        turnsOnCurrentTier: 0,
+        inputTokens: usage.inputTokens,
+        outputTokens: usage.outputTokens,
+        cacheCreationTokens: usage.cacheCreationTokens,
+        cacheReadTokens: usage.cacheReadTokens,
+        actualCostUsd: cost,
+        counterfactualNoRoutingCostUsd: cost,
+      });
+    }
+    return;
+  }
 
   // An unrecognized model is not a routing decision we are able to make:
   // we cannot price it, cannot compare tiers against it, and must not
@@ -323,16 +371,24 @@ export async function handleMessages(
   const messages: any[] = Array.isArray(body.messages) ? body.messages : [];
   const latestUserMessage = extractLatestUserText(messages);
 
+  // A tool-result continuation is the next step of a turn whose tier was
+  // already settled; asking the classifier again costs a call per step and
+  // could only trigger a mid-loop switch. Hold, and log it as its own
+  // decision so it is not mistaken for a classifier failure.
+  const skipped = isToolResultContinuation(messages);
+
   // Passing the request signal means a client disconnect cancels the
   // classification too, instead of leaving a billed request in flight.
-  const classification = await classify(
-    {
-      recentMessages: sanitizeForClassifier(messages.slice(-6)),
-      latestUserMessage,
-    },
-    { signal }
-  );
-  if (!classification) {
+  const classification = skipped
+    ? null
+    : await classify(
+        {
+          recentMessages: sanitizeForClassifier(messages.slice(-6)),
+          latestUserMessage,
+        },
+        { signal }
+      );
+  if (!classification && !skipped) {
     console.warn(
       "typesafe-claude-router: classifier unavailable this turn (TypeSafe error or timeout) - holding current tier"
     );
@@ -374,18 +430,15 @@ export async function handleMessages(
   // clobbers an exact pin (claude-opus-5-20260101) with the bare tier
   // alias, silently changing which snapshot serves the turn while the
   // ledger records it as a no-op.
-  if (mode === "live" && targetTier !== requestedTier) {
+  if (targetTier !== requestedTier) {
     outgoingModel = pricing.modelAlias[targetTier];
     body.model = outgoingModel;
   }
 
-  // Shadow mode's whole contract is "never change what actually happens,
-  // only log what would have happened." Injecting this note into the
-  // conversation content the model sees is a real behavior change (it can
-  // change what the model says to the user), so it's gated to live mode
-  // like the model-field rewrite above - otherwise "shadow mode" was
-  // quietly not shadow for this one feature.
-  if (mode === "live" && decision.kind === "upgrade-suggested" && messages.length > 0) {
+  // The note is injected into the conversation content the model sees,
+  // so it is a real behavior change: it can change what the model says to
+  // the user. It only ever suggests; the user decides whether to act.
+  if (decision.kind === "upgrade-suggested" && messages.length > 0) {
     const last = messages[messages.length - 1];
     if (last.role === "user") {
       const note = buildUpgradeNoteBlock(decision.to, decision.estimatedCostUsd);
@@ -398,7 +451,7 @@ export async function handleMessages(
 
   const { response: upstreamResponse, usage } = await forwardAndStream(req, res, body, upstream, signal);
 
-  const actualModel = mode === "live" ? outgoingModel : requestedModelString;
+  const actualModel = outgoingModel;
   const actualTier = tierForModel(pricing, actualModel) ?? targetTier;
 
   // A non-2xx upstream response (rate limit, auth failure, malformed
@@ -460,7 +513,7 @@ export async function handleMessages(
       confidence: classification?.confidence ?? null,
       downgradeMargin: marginInfo?.downgradeMargin ?? 0,
       upgradeMargin: marginInfo?.upgradeMargin ?? 0,
-      decision: classification ? decision.kind : "classifier-unavailable",
+      decision: classification ? decision.kind : skipped ? "skipped-tool-result" : "classifier-unavailable",
       resetDetected:
         decision.kind === "downgraded-on-reset" || decision.kind === "upgraded-on-reset",
       suggestedUpgradeTo: decision.kind === "upgrade-suggested" ? decision.to : null,
@@ -577,9 +630,9 @@ export function validateStartupConfig(env: NodeJS.ProcessEnv): string[] {
       "TYPESAFE_API_KEY is not set: every turn would log classifier-unavailable and the router would never route."
     );
   }
-  if (env.ROUTER_MODE === "live" && !env.ROUTER_MAX_TIER?.trim()) {
+  if (!env.ROUTER_MAX_TIER?.trim()) {
     problems.push(
-      "ROUTER_MODE=live with no ROUTER_MAX_TIER: nothing caps autonomous spend. Set ROUTER_MAX_TIER=opus unless you mean to allow fable."
+      "No ROUTER_MAX_TIER: nothing caps autonomous spend. Set ROUTER_MAX_TIER=opus unless you mean to allow fable."
     );
   }
   return problems;
@@ -614,8 +667,7 @@ if (isMainModule(import.meta.url)) {
   // broadly (e.g. inside a container).
   const host = process.env.HOST ?? "127.0.0.1";
   createProxyServer().listen(port, host, () => {
-    const mode = process.env.ROUTER_MODE === "live" ? "live" : "shadow";
-    console.log(`typesafe-claude-router listening on http://${host}:${port} (mode=${mode})`);
+    console.log(`typesafe-claude-router listening on http://${host}:${port}`);
     console.log(`classifier: ${describeBackend(process.env)}`);
   });
 }
